@@ -1,10 +1,12 @@
-use nix::sys::socket::{accept, bind, listen, send, recv, socket, AddressFamily, Backlog, MsgFlags, SockFlag, SockType, UnixAddr};
+use kv_shared::{kvs_recv_all, kvs_send_all, KVConnection};
+use nix::errno::Errno;
+use nix::sys::socket::{accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
 use nix::unistd::{close, unlink};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::str::from_utf8;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+fn main() -> Result<(), Errno> {
     println!("server: start");
 
     let socket_path = Path::new("./kv.sock");
@@ -12,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(_) => (),
         Err(e) => {
             eprintln!("unlink socket_path: {}", e);
-            ()
+            return Err(e);
         }
     };
 
@@ -30,37 +32,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     listen(&sockfd, Backlog::MAXCONN).expect("listen failed");
     
-    loop {
+    'accept_connections: loop {
         println!("server: listening on socket");
-        let connfd: RawFd = accept(sockfd.as_raw_fd()).expect("accept failed");
+        let connfd_raw: RawFd = accept(sockfd.as_raw_fd()).expect("accept failed");
+        let connfd = unsafe { OwnedFd::from_raw_fd(connfd_raw) };
         println!("server: connection accepted");
 
-        let msg =  "Hello Darling";
-        send(connfd, msg.as_bytes(), MsgFlags::empty()).expect("send failed");
-        println!("server: msg sent");
+        let connection = KVConnection{
+            fd: connfd,
+            mtu: 1024,
+        };
 
-
-        let mut buf = [0u8; 1024];
-        match recv(connfd, &mut buf, MsgFlags::empty()){
-            Ok(0) => {
-                println!("server: client disconnected");
-                close(connfd).expect("close connfd failed");
-                continue;
-            },
-            Ok(n) => {
-                let msg_recvd = from_utf8(&buf[..n]).expect("invalid utf-e");
-                println!("server: received, '{}'", msg_recvd);
-                if msg_recvd == "stop" {
-                    break;
+        'connection: loop{
+            let result = match kvs_recv_all(&connection){
+                Ok(kvv) => kvv,
+                Err(Errno::ECONNRESET) => {
+                    println!("server: client disconnected");
+                    break 'connection;
+                },
+                Err(e) => {
+                    eprintln!("kv-server: kvs_recv_all: error {}", e);
+                    return Err(e);
                 }
-                continue;
-            }
-            Err(e) => {
-                eprint!("recv error: {}", e);
-                close(connfd).expect("close connfd failed");
-                break;
+            };
+
+            let result_as_str = String::from_utf8(result.data).unwrap();
+            let results_split: Vec<&str> = result_as_str.trim().split_whitespace().collect();
+            match results_split.get(0) {
+                Some(&"GET") => {
+                    let msg = String::from("good get!").into_bytes();
+                    kvs_send_all(&connection, msg).unwrap();
+                    println!("server: handled GET");
+                },
+                Some(&"SET") => {
+                    let msg = String::from("good set!").into_bytes();
+                    kvs_send_all(&connection, msg).unwrap();
+                    println!("server: handled SET");
+    
+                },
+                Some(&"DEL") => {
+                    let msg = String::from("good del!").into_bytes();
+                    kvs_send_all(&connection, msg).unwrap();
+                    println!("server: handled DEL");
+    
+                },
+                _ => {
+                    println!("server: received unknown command {}", result_as_str);
+                }
             }
         }
+
+        //break 'accept_connections somehow...
     }
 
     close(sockfd).expect("close sockfd failed");

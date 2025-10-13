@@ -2,7 +2,7 @@
 use nix::sys::socket::{socket, connect, AddressFamily, SockFlag, SockType, UnixAddr};
 use std::os::fd::{AsRawFd};
 use nix::{errno::Errno};
-use kv_shared::{KVConnection, KVValue, kvs_recv_all, kvs_send_all};
+use kv_shared::{KVConnection, KVValue, recv_all, send_all};
 
 
 pub fn kvc_connect(sock_addr: UnixAddr) -> Result<KVConnection, Errno>{
@@ -40,8 +40,8 @@ pub fn kvc_get(connection: &KVConnection, key: &str) -> Result<KVValue, Errno> {
     // form msg
     let msg = format!("GET {}", key).into_bytes();
 
-    kvs_send_all(connection, msg).unwrap();
-    let result = kvs_recv_all(connection).unwrap();
+    send_all(connection, msg).unwrap();
+    let result = recv_all(connection).unwrap();
 
     Ok(result)
 }
@@ -51,8 +51,8 @@ pub fn kvc_set(connection: &KVConnection, key: &str, value: &str) -> Result<KVVa
     // do something better...
     let msg = format!("SET {} {}", key, value).into_bytes();
 
-    kvs_send_all(connection, msg).unwrap();
-    let result = kvs_recv_all(connection).unwrap();
+    send_all(connection, msg).unwrap();
+    let result = recv_all(connection).unwrap();
 
     Ok(result)
 }
@@ -61,8 +61,8 @@ pub fn kvc_delete(connection: &KVConnection, key: &str) -> Result<KVValue, Errno
     // form msg
     let msg = format!("DEL {}", key).into_bytes();
 
-    kvs_send_all(connection, msg).unwrap();
-    let result = kvs_recv_all(connection).unwrap();
+    send_all(connection, msg).unwrap();
+    let result = recv_all(connection).unwrap();
 
     Ok(result)
 }

@@ -12,9 +12,8 @@ pub struct KVValue{
     pub size: usize,
 }
 
-/// kvs_recv_all
 /// Ensures full receipt of msg from KVConnection
-pub fn kvs_recv_all(connection: &KVConnection) -> Result<KVValue, Errno>{
+pub fn recv_all(connection: &KVConnection) -> Result<KVValue, Errno>{
 
     // receive msg length
     let mut len_buf= [0u8;4];
@@ -53,9 +52,8 @@ pub fn kvs_recv_all(connection: &KVConnection) -> Result<KVValue, Errno>{
 }
 
 
-/// kvs_send_all
 /// Ensures full send of msg from KVConnection
-pub fn kvs_send_all(connection: &KVConnection, msg: Vec<u8>) -> Result<(), Errno>{
+pub fn send_all(connection: &KVConnection, msg: Vec<u8>) -> Result<(), Errno>{
     
     if msg.len() > u32::MAX as usize {
         return Err(Errno::EMSGSIZE);

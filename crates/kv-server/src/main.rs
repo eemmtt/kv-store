@@ -1,10 +1,9 @@
-use kv_shared::{kvs_recv_all, kvs_send_all, KVConnection};
+use kv_shared::{recv_all, send_all, KVConnection};
 use nix::errno::Errno;
 use nix::sys::socket::{accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
 use nix::unistd::{close, unlink};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
-
 
 fn main() -> Result<(), Errno> {
     println!("server: start");
@@ -44,35 +43,40 @@ fn main() -> Result<(), Errno> {
         };
 
         'connection: loop{
-            let result = match kvs_recv_all(&connection){
+            let result = match recv_all(&connection){
                 Ok(kvv) => kvv,
                 Err(Errno::ECONNRESET) => {
                     println!("server: client disconnected");
                     break 'connection;
                 },
                 Err(e) => {
-                    eprintln!("kv-server: kvs_recv_all: error {}", e);
+                    eprintln!("kv-server: kv-shared::recv_all: error {}", e);
                     return Err(e);
                 }
             };
 
             let result_as_str = String::from_utf8(result.data).unwrap();
-            let results_split: Vec<&str> = result_as_str.trim().split_whitespace().collect();
-            match results_split.get(0) {
-                Some(&"GET") => {
+            let mut parts = result_as_str.trim().splitn(3, ' ');
+
+            let command = parts.next().unwrap_or("");
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+
+            match command {
+                "GET" => {
                     let msg = String::from("good get!").into_bytes();
-                    kvs_send_all(&connection, msg).unwrap();
+                    send_all(&connection, msg).unwrap();
                     println!("server: handled GET");
                 },
-                Some(&"SET") => {
+                "SET" => {
                     let msg = String::from("good set!").into_bytes();
-                    kvs_send_all(&connection, msg).unwrap();
+                    send_all(&connection, msg).unwrap();
                     println!("server: handled SET");
     
                 },
-                Some(&"DEL") => {
+                "DEL" => {
                     let msg = String::from("good del!").into_bytes();
-                    kvs_send_all(&connection, msg).unwrap();
+                    send_all(&connection, msg).unwrap();
                     println!("server: handled DEL");
     
                 },

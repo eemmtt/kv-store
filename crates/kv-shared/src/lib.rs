@@ -1,5 +1,5 @@
 use nix::sys::socket::{ send, recv, MsgFlags };
-use std::{os::fd::{ AsRawFd, OwnedFd, RawFd}, u32};
+use std::{os::fd::{ AsRawFd, OwnedFd, RawFd}, path::Path, u32};
 use nix::{errno::Errno, libc::size_t};
 
 pub struct KVConnection{

@@ -1,39 +1,30 @@
 use kv_shared::{recv_all, send_all, KVConnection};
 use nix::errno::Errno;
-use nix::sys::socket::{accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
+use nix::sys::socket::{accept};
 use nix::unistd::{close, unlink};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+
+use kv_server::{self, open_socket};
 
 fn main() -> Result<(), Errno> {
     println!("server: start");
 
     let socket_path = Path::new("./kv.sock");
-    let _ = match unlink(socket_path){
-        Ok(_) => (),
+    let socket_fd = match open_socket(socket_path){
+        Ok(result) => result,
         Err(e) => {
-            eprintln!("unlink socket_path: {}", e);
+            eprintln!("server: open_socket {}", e);
             return Err(e);
         }
     };
-
-    let sockfd = socket(
-        AddressFamily::Unix, 
-        SockType::Stream,
-        SockFlag::empty(),
-        None,
-    ).expect("socket failed");
-    println!("server: unix socket created");
-
-    let addr = UnixAddr::new("./kv.sock").expect("UnixAddr failed");
-    bind(sockfd.as_raw_fd(), &addr).expect("bind failed");
-    println!("server: socket binded");
-
-    listen(&sockfd, Backlog::MAXCONN).expect("listen failed");
     
+    println!("server: listening on socket");
     'accept_connections: loop {
-        println!("server: listening on socket");
-        let connfd_raw: RawFd = accept(sockfd.as_raw_fd()).expect("accept failed");
+
+        // add polling
+        
+        let connfd_raw: RawFd = accept(socket_fd.as_raw_fd()).expect("accept failed");
         let connfd = unsafe { OwnedFd::from_raw_fd(connfd_raw) };
         println!("server: connection accepted");
 
@@ -42,12 +33,12 @@ fn main() -> Result<(), Errno> {
             mtu: 1024,
         };
 
-        'connection: loop{
+        'handle_connection: loop{
             let result = match recv_all(&connection){
                 Ok(kvv) => kvv,
                 Err(Errno::ECONNRESET) => {
                     println!("server: client disconnected");
-                    break 'connection;
+                    break 'handle_connection;
                 },
                 Err(e) => {
                     eprintln!("kv-server: kv-shared::recv_all: error {}", e);
@@ -86,10 +77,10 @@ fn main() -> Result<(), Errno> {
             }
         }
 
-        //break 'accept_connections somehow...
+        //break 'accept_connections with stdin
     }
 
-    close(sockfd).expect("close sockfd failed");
+    close(socket_fd).expect("close socket_fd failed");
     unlink(socket_path).expect("unlink failed");
     println!("server: stop");
     Ok(())

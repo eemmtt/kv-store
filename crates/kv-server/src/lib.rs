@@ -16,6 +16,7 @@ pub fn open_socket(path: &Path) -> Result<OwnedFd, Errno>{
 
     let _ = match unlink(path){
         Ok(_) => (),
+        Err(Errno::ENOENT) => (), /* .sock already exists, continue */
         Err(e) => {
             eprintln!("open_socket: unlink socket_path: {}", e);
             return Err(e);

@@ -1,6 +1,6 @@
-use std::{os::fd::{RawFd, AsRawFd, OwnedFd, FromRawFd}, path::Path};
-use nix::{errno::Errno, sys::socket::{accept,bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr}, unistd::unlink};
-use kv_shared::{send_all, recv_all, KVConnection, KVValue};
+use std::{os::{fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}}, path::Path};
+use nix::{errno::Errno, sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, unistd::unlink};
+use kv_shared::{send_all, recv_all, KVConnection};
 
 /// Get value from log
 pub fn log_get(){}
@@ -44,6 +44,8 @@ pub enum PollInterests {
 }
 
 pub fn handle_connection(socket_fd: &OwnedFd) -> Result<(), Errno>{
+    /* todo: write connectionfd into a buffer */
+
     let connfd_raw: RawFd = accept(socket_fd.as_raw_fd()).expect("accept failed");
     let connfd = unsafe { OwnedFd::from_raw_fd(connfd_raw) };
     println!("server: connection accepted");
@@ -99,4 +101,57 @@ pub fn handle_connection(socket_fd: &OwnedFd) -> Result<(), Errno>{
     }
 
     Ok(())
+}
+
+pub mod threading {
+    use std::ffi::c_void;
+    use nix::libc::{pthread_t, pthread_create, pthread_self, pthread_detach};
+    use nix::errno::Errno;
+    
+    /// Data passed as arg to worker_thread
+    pub struct WorkerData{
+        pub id: u64,
+    }
+    
+    /// start routine for worker threads
+    pub extern "C" fn worker_thread(arg: *mut c_void) -> *mut c_void{
+        kv_pthread_detach().unwrap();
+        let data = unsafe { Box::from_raw(arg as *mut WorkerData)};
+        println!("Hello from worker thread #{}!", data.id);
+    
+        std::ptr::null_mut()
+    }
+    
+    /// Wrapper for libc::pthread_create, takes no attributes
+    pub fn kv_pthread_create(
+        thread: *mut pthread_t,  
+        thread_fn: extern "C" fn(*mut c_void) -> *mut c_void, 
+        fn_arg: *mut c_void 
+    ) -> Result<(), Errno>{
+    
+        let res = unsafe { 
+            pthread_create(thread, std::ptr::null(), thread_fn, fn_arg) 
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            let e = Errno::from_raw(res);
+            eprintln!("pthread_create: {}", e);
+            Err(e)
+        }
+    }
+    
+    /// Wrapper for libc::pthread_detach, detaches the calling thread
+    pub fn kv_pthread_detach() -> Result<(), Errno>{
+    
+        let tid = unsafe { pthread_self() };
+        let res = unsafe { pthread_detach(tid) };
+        if res == 0 {
+            Ok(())
+        } else {
+            let e = Errno::from_raw(res);
+            eprintln!("pthread_detach: {}", e);
+            Err(e)
+        }
+    }
 }

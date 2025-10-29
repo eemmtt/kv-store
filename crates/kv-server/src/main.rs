@@ -1,19 +1,31 @@
 use nix::errno::Errno;
+use nix::libc::pthread_t;
 use nix::poll::PollTimeout;
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 use nix::unistd::{close, unlink};
 use std::collections::HashMap;
 use std::os::fd::{ OwnedFd};
+use std::os::raw::c_void;
 use std::path::Path;
 
 use kv_server::{self, PollInterests, handle_connection, open_socket};
+use kv_server::threading::{WorkerData, kv_pthread_create, worker_thread};
 
 fn main() -> Result<(), Errno> {
     println!("server: start");
 
-    /* todo: init prethreading */
+    /* init worker thread pool */
+    const POOL_SIZE: usize = 5;
+    for i in 0..POOL_SIZE {
+        let mut thread = 0 as pthread_t;
+        let data = Box::new(WorkerData {
+            id: i as u64,
+        });
+        let arg = Box::into_raw(data) as *mut c_void;
+        kv_pthread_create(&mut thread, worker_thread, arg).unwrap();
+    }
 
-
+    /* init listening socket */
     let socket_path = Path::new("./kv.sock");
     let socket_fd = match open_socket(socket_path){
         Ok(result) => result,
@@ -55,9 +67,9 @@ fn main() -> Result<(), Errno> {
         
         for event in events {
             if event.data() == PollInterests::ListeningSocket as u64 {
-                /* todo: write connectionfd into a buffer */
                 println!("server: got a {:?} event on Listening Socket", event.events());
-                handle_connection(fds.get(&(PollInterests::ListeningSocket as u64)).expect("get")).unwrap();
+                let listenfd = fds.get(&(PollInterests::ListeningSocket as u64)).unwrap();
+                handle_connection(listenfd).unwrap();
             } else {
                 println!("Got an unhandled {:?} with data {:?}", event.events(), event.data());
             }

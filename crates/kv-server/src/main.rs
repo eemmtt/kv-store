@@ -1,25 +1,30 @@
+use kv_shared::rbuf::FdRingBuffer;
 use nix::errno::Errno;
 use nix::libc::pthread_t;
 use nix::poll::PollTimeout;
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 use nix::unistd::{close, unlink};
 use std::collections::HashMap;
-use std::os::fd::{ OwnedFd};
+use std::os::fd::{ OwnedFd, RawFd};
 use std::os::raw::c_void;
 use std::path::Path;
 
-use kv_server::{self, PollInterests, handle_connection, open_socket};
+use kv_server::{self, PollInterests, accept_connection, handle_connection, open_socket};
 use kv_server::threading::{WorkerData, kv_pthread_create, worker_thread};
 
 fn main() -> Result<(), Errno> {
     println!("server: start");
 
+    /* init work ring buffer */
+    let mut rbuf = FdRingBuffer::init();
+    
     /* init worker thread pool */
     const POOL_SIZE: usize = 5;
     for i in 0..POOL_SIZE {
         let mut thread = 0 as pthread_t;
         let data = Box::new(WorkerData {
             id: i as u64,
+            rbuf: &mut rbuf,
         });
         let arg = Box::into_raw(data) as *mut c_void;
         kv_pthread_create(&mut thread, worker_thread, arg).unwrap();
@@ -50,7 +55,7 @@ fn main() -> Result<(), Errno> {
     };
 
     /* todo: accept commands from stdin */
-    /* todo: handle signals gracefully with signalfd */
+    /* todo: handle signals gracefully with "self pipe trick" */
 
     /* start polling */
     let mut events = [EpollEvent::empty()];
@@ -69,7 +74,8 @@ fn main() -> Result<(), Errno> {
             if event.data() == PollInterests::ListeningSocket as u64 {
                 println!("server: got a {:?} event on Listening Socket", event.events());
                 let listenfd = fds.get(&(PollInterests::ListeningSocket as u64)).unwrap();
-                handle_connection(listenfd).unwrap();
+                accept_connection(listenfd, &mut rbuf).unwrap();
+                println!("server: accepted connection to buffer");
             } else {
                 println!("Got an unhandled {:?} with data {:?}", event.events(), event.data());
             }

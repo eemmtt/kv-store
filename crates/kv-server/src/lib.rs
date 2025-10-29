@@ -1,6 +1,6 @@
 use std::{os::{fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}}, path::Path};
 use nix::{errno::Errno, sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, unistd::unlink};
-use kv_shared::{send_all, recv_all, KVConnection};
+use kv_shared::{KVConnection, rbuf::FdRingBuffer, recv_all, send_all};
 
 /// Get value from log
 pub fn log_get(){}
@@ -43,28 +43,31 @@ pub enum PollInterests {
     Signal = 2,
 }
 
-pub fn handle_connection(socket_fd: &OwnedFd) -> Result<(), Errno>{
+pub fn accept_connection(socket_fd: &OwnedFd, rbuf: &mut FdRingBuffer) -> Result<(), Errno>{
     /* todo: write connectionfd into a buffer */
 
     let connfd_raw: RawFd = accept(socket_fd.as_raw_fd()).expect("accept failed");
     let connfd = unsafe { OwnedFd::from_raw_fd(connfd_raw) };
-    println!("server: connection accepted");
+    rbuf.put(connfd).expect("FdRingBuffer full or bad put");
+    return Ok(());
+}
+
+pub fn handle_connection(fd: OwnedFd, workerid: u64) -> Result<(), Errno>{
 
     let connection = KVConnection{
-        fd: connfd,
+        fd: fd,
         mtu: 1024,
     };
 
     loop {
-
         let result = match recv_all(&connection){
             Ok(kvv) => kvv,
             Err(Errno::ECONNRESET) => {
-                println!("handle_connection: client disconnected");
+                println!("worker #{} handle_connection: client disconnected", workerid);
                 break;
             },
             Err(e) => {
-                eprintln!("kv-server: kv-shared::recv_all: error {}", e);
+                eprintln!("handle_connection recv_all: error {}", e);
                 return Err(e);
             }
         };
@@ -80,18 +83,18 @@ pub fn handle_connection(socket_fd: &OwnedFd) -> Result<(), Errno>{
             "GET" => {
                 let msg = String::from("good get!").into_bytes();
                 send_all(&connection, msg).unwrap();
-                println!("handle_connection: handled GET");
+                println!("worker #{}: handled GET", workerid);
             },
             "SET" => {
                 let msg = String::from("good set!").into_bytes();
                 send_all(&connection, msg).unwrap();
-                println!("handle_connection: handled SET");
+                println!("worker #{}: handled SET", workerid);
     
             },
             "DEL" => {
                 let msg = String::from("good del!").into_bytes();
                 send_all(&connection, msg).unwrap();
-                println!("handle_connection: handled DEL");
+                println!("worker #{}: handled DEL", workerid);
     
             },
             _ => {
@@ -105,12 +108,16 @@ pub fn handle_connection(socket_fd: &OwnedFd) -> Result<(), Errno>{
 
 pub mod threading {
     use std::ffi::c_void;
+    use kv_shared::rbuf::FdRingBuffer;
     use nix::libc::{pthread_t, pthread_create, pthread_self, pthread_detach};
     use nix::errno::Errno;
+
+    use crate::handle_connection;
     
     /// Data passed as arg to worker_thread
-    pub struct WorkerData{
+    pub struct WorkerData<'a>{
         pub id: u64,
+        pub rbuf: &'a mut FdRingBuffer,
     }
     
     /// start routine for worker threads
@@ -118,6 +125,19 @@ pub mod threading {
         kv_pthread_detach().unwrap();
         let data = unsafe { Box::from_raw(arg as *mut WorkerData)};
         println!("Hello from worker thread #{}!", data.id);
+
+        loop {
+            /* todo: block on buffer.get() */
+            let fd = match data.rbuf.get(){
+                Some(fd) => fd,
+                None => {
+                    continue;
+                }
+            };
+
+            handle_connection(fd,data.id).expect("oops at handle_connection");
+            break;
+        }
     
         std::ptr::null_mut()
     }

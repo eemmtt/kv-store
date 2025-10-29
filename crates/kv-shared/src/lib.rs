@@ -1,6 +1,6 @@
 use nix::sys::socket::{ send, recv, MsgFlags };
 use std::{os::fd::{ AsRawFd, OwnedFd, RawFd}, path::Path, u32};
-use nix::{errno::Errno, libc::size_t};
+use nix::{libc, errno::Errno, libc::size_t};
 
 pub struct KVConnection{
     pub fd: OwnedFd,
@@ -84,4 +84,64 @@ pub fn send_all(connection: &KVConnection, msg: Vec<u8>) -> Result<(), Errno>{
     }
 
     Ok(())
+}
+
+
+pub mod rbuf {
+    use std::os::fd::{OwnedFd};
+
+    /* todo: implement ring buffer */
+    const RING_BUFFER_SIZE: usize = 4096 / std::mem::size_of::<Option<OwnedFd>>();
+    pub struct FdRingBuffer {
+        buf: Vec<Option<OwnedFd>>,
+        stored: usize,
+        head: usize,
+        tail: usize,
+        mask: usize,
+    }
+
+    impl FdRingBuffer {
+        pub fn init()-> Self{
+            let mut newbuf: Vec<Option<OwnedFd>> = vec![];
+            for _ in 0..RING_BUFFER_SIZE {
+                newbuf.push(None);
+            }
+            Self {
+                buf: newbuf,
+                stored: 0,
+                head: 0,
+                tail: 0,
+                mask: 0xFFF,
+            }
+        }
+    
+        pub fn put(&mut self, fd: OwnedFd) -> Result<(), OwnedFd>{
+            if self.stored == self.buf.len() {
+                return Err(fd)
+            }
+            let index = self.head & self.mask;
+            self.buf[index] = Some(fd);
+
+            self.head += 1;
+            self.stored += 1;
+            Ok(())
+        }   
+
+        pub fn get(&mut self) -> Option<OwnedFd>{
+            if self.stored == 0 {
+                return None;
+            }
+
+            let index = self.tail & self.mask;
+            let fd = self.buf[index].take()?;
+
+            self.tail += 1;
+            self.stored -= 1;
+
+            Some(fd)
+        }
+    }
+
+
+    
 }

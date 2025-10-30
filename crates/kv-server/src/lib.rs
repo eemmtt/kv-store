@@ -127,16 +127,13 @@ pub mod threading {
         println!("Hello from worker thread #{}!", data.id);
 
         loop {
-            /* todo: block on buffer.get() */
             let fd = match data.rbuf.get(){
                 Some(fd) => fd,
                 None => {
                     continue;
                 }
             };
-
             handle_connection(fd,data.id).expect("oops at handle_connection");
-            break;
         }
     
         std::ptr::null_mut()

@@ -1,4 +1,4 @@
-use kv_shared::rbuf::FdRingBuffer;
+use kv_shared::ringbuffer::FdRingBuffer;
 use nix::errno::Errno;
 use nix::libc::pthread_t;
 use nix::poll::PollTimeout;
@@ -19,8 +19,8 @@ fn main() -> Result<(), Errno> {
     let mut rbuf = FdRingBuffer::init();
     
     /* init worker thread pool */
-    const POOL_SIZE: usize = 5;
-    for i in 0..POOL_SIZE {
+    const THREAD_POOL_SIZE: usize = 5;
+    for i in 0..THREAD_POOL_SIZE {
         let mut thread = 0 as pthread_t;
         let data = Box::new(WorkerData {
             id: i as u64,
@@ -40,9 +40,9 @@ fn main() -> Result<(), Errno> {
         }
     };
 
-    /* register PollInterests to fds */
-    let mut fds: HashMap<u64, &OwnedFd> = HashMap::new();
-    fds.insert(PollInterests::ListeningSocket as u64, &socket_fd);
+    /* register PollInterests to interestfds */
+    let mut interestfds: HashMap<u64, &OwnedFd> = HashMap::new();
+    interestfds.insert(PollInterests::ListeningSocket as u64, &socket_fd);
 
     /* add interests to epoll */
     let epoll = Epoll::new(EpollCreateFlags::empty())?;
@@ -73,12 +73,14 @@ fn main() -> Result<(), Errno> {
         for event in events {
             if event.data() == PollInterests::ListeningSocket as u64 {
                 println!("server: got a {:?} event on Listening Socket", event.events());
-                let listenfd = fds.get(&(PollInterests::ListeningSocket as u64)).unwrap();
+                let listenfd = interestfds.get(&(PollInterests::ListeningSocket as u64)).unwrap();
                 accept_connection(listenfd, &mut rbuf).unwrap();
                 println!("server: put accepted connection to buffer");
             } else {
                 println!("Got an unhandled {:?} with data {:?}", event.events(), event.data());
             }
+
+            /* todo: break loop on SIGINT*/
         }
 
     }

@@ -87,7 +87,7 @@ pub fn send_all(connection: &KVConnection, msg: Vec<u8>) -> Result<(), Errno>{
 }
 
 
-pub mod rbuf {
+pub mod ringbuffer {
     use std::os::fd::{OwnedFd};
     use nix::libc::{pthread_mutex_t, sem_t};
 
@@ -106,6 +106,8 @@ pub mod rbuf {
     }
 
     impl FdRingBuffer {
+
+        /// Init buffer
         pub fn init()-> Self{
             let mut newbuf: Vec<Option<OwnedFd>> = vec![];
             for _ in 0..RING_BUFFER_SIZE {
@@ -127,6 +129,7 @@ pub mod rbuf {
             }
         }
     
+        /// Put an fd in the buffer, blocking
         pub fn put(&mut self, fd: OwnedFd) -> Result<(), OwnedFd>{
             kv_sem_wait(&mut self.spaces).unwrap();
             kv_mutex_lock(&mut self.mtx).unwrap();
@@ -141,6 +144,7 @@ pub mod rbuf {
             Ok(())
         }   
 
+        // Get an fd from the buffer, blocking
         pub fn get(&mut self) -> Option<OwnedFd>{
             kv_sem_wait(&mut self.items).unwrap();
             kv_mutex_lock(&mut self.mtx).unwrap();
@@ -164,7 +168,7 @@ pub mod semaphores{
     use nix::{errno::Errno, libc::{pthread_mutex_init, pthread_mutex_lock, pthread_mutex_t, pthread_mutex_unlock, sem_init, sem_post, sem_t, sem_wait}};
 
 
-    /// Wrapper for phread_mutex_init()
+    /// Wrapper for libc::phread_mutex_init()
     pub fn kv_mutex_init() -> Result<pthread_mutex_t, Errno> {
         let mut mtx: pthread_mutex_t = unsafe { std::mem::zeroed() };
         let res = unsafe {pthread_mutex_init(&mut mtx, std::ptr::null())};
@@ -174,7 +178,7 @@ pub mod semaphores{
         Ok(mtx)
     }
     
-    /// Wrapper for pthread_mutex_lock()
+    /// Wrapper for libc::pthread_mutex_lock()
     pub fn kv_mutex_lock(mtx: &mut pthread_mutex_t) -> Result<(), Errno> {
         let res = unsafe {pthread_mutex_lock(mtx)};
         if res != 0 {
@@ -183,7 +187,7 @@ pub mod semaphores{
         Ok(())
     }
     
-    /// Wrapper for pthread_mutex_unlock()
+    /// Wrapper for libc::pthread_mutex_unlock()
     pub fn kv_mutex_unlock(mtx: &mut pthread_mutex_t) -> Result<(), Errno> {
         let res = unsafe {pthread_mutex_unlock(mtx)};
         if res != 0 {
@@ -192,7 +196,7 @@ pub mod semaphores{
         Ok(())
     }
     
-    /// Wrapper for sem_init()
+    /// Wrapper for libc::sem_init()
     pub fn kv_sem_init(value: usize) -> Result<sem_t, Errno> {
         let mut sem: sem_t = unsafe { std::mem::zeroed() };
         let res = unsafe {
@@ -204,7 +208,7 @@ pub mod semaphores{
         }
     }
     
-    /// Wrapper for sem_wait()
+    /// Wrapper for libc::sem_wait()
     pub fn kv_sem_wait(sem: &mut sem_t) -> Result<(), Errno>{
         let res = unsafe {sem_wait(sem)};
         if res == 0 {
@@ -214,7 +218,7 @@ pub mod semaphores{
         }
     }
     
-    /// Wrapper for sem_post()
+    /// Wrapper for libc::sem_post()
     pub fn kv_sem_post(sem: &mut sem_t) -> Result<(), Errno>{
         let res = unsafe {sem_post(sem)};
         if res == 0 {

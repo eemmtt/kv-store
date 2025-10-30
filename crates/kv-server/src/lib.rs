@@ -1,6 +1,6 @@
 use std::{os::{fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}}, path::Path};
 use nix::{errno::Errno, sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, unistd::unlink};
-use kv_shared::{KVConnection, rbuf::FdRingBuffer, recv_all, send_all};
+use kv_shared::{KVConnection, ringbuffer::FdRingBuffer, recv_all, send_all};
 
 /// Get value from log
 pub fn log_get(){}
@@ -108,7 +108,7 @@ pub fn handle_connection(fd: OwnedFd, workerid: u64) -> Result<(), Errno>{
 
 pub mod threading {
     use std::ffi::c_void;
-    use kv_shared::rbuf::FdRingBuffer;
+    use kv_shared::ringbuffer::FdRingBuffer;
     use nix::libc::{pthread_t, pthread_create, pthread_self, pthread_detach};
     use nix::errno::Errno;
 

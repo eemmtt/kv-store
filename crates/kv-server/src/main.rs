@@ -5,11 +5,11 @@ use nix::poll::PollTimeout;
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 use nix::unistd::{close, unlink};
 use std::collections::HashMap;
-use std::os::fd::{ OwnedFd, RawFd};
+use std::os::fd::{ OwnedFd };
 use std::os::raw::c_void;
 use std::path::Path;
 
-use kv_server::{self, PollInterests, accept_connection, handle_connection, open_socket};
+use kv_server::{self, PollInterests, accept_connection, open_socket};
 use kv_server::threading::{WorkerData, kv_pthread_create, worker_thread};
 
 fn main() -> Result<(), Errno> {
@@ -75,7 +75,7 @@ fn main() -> Result<(), Errno> {
                 println!("server: got a {:?} event on Listening Socket", event.events());
                 let listenfd = fds.get(&(PollInterests::ListeningSocket as u64)).unwrap();
                 accept_connection(listenfd, &mut rbuf).unwrap();
-                println!("server: accepted connection to buffer");
+                println!("server: put accepted connection to buffer");
             } else {
                 println!("Got an unhandled {:?} with data {:?}", event.events(), event.data());
             }

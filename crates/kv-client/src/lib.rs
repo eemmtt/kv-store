@@ -2,7 +2,7 @@
 use nix::sys::socket::{socket, connect, AddressFamily, SockFlag, SockType, UnixAddr};
 use std::os::fd::{AsRawFd};
 use nix::{errno::Errno};
-use kv_shared::{KVConnection, KVValue, recv_all, send_all};
+use kv_shared::io::{KVConnection, KVValue, recv_all, send_all};
 
 
 pub fn kvc_connect(sock_addr: UnixAddr) -> Result<KVConnection, Errno>{

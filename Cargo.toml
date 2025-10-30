@@ -5,4 +5,4 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.dependencies]
-nix = { version = "0.30.1", features = ["fs", "socket", "event"] }
+nix = { version = "0.30.1", features = ["fs", "socket", "event", "signal"] }

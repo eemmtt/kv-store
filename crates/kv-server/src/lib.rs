@@ -1,6 +1,6 @@
 use std::{os::{fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}}, path::Path};
 use nix::{errno::Errno, sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, unistd::unlink};
-use kv_shared::{KVConnection, ringbuffer::FdRingBuffer, recv_all, send_all};
+use kv_shared::{ringbuffer::FdRingBuffer};
 
 /// Get value from log
 pub fn log_get(){}
@@ -37,12 +37,6 @@ pub fn open_socket(path: &Path) -> Result<OwnedFd, Errno>{
     Ok(sockfd)
 }
 
-pub enum PollInterests {
-    ListeningSocket = 0,
-    TerminalInput = 1,
-    Signal = 2,
-}
-
 pub fn accept_connection(socket_fd: &OwnedFd, rbuf: &mut FdRingBuffer) -> Result<(), Errno>{
     /* todo: write connectionfd into a buffer */
 
@@ -52,67 +46,69 @@ pub fn accept_connection(socket_fd: &OwnedFd, rbuf: &mut FdRingBuffer) -> Result
     return Ok(());
 }
 
-pub fn handle_connection(fd: OwnedFd, workerid: u64) -> Result<(), Errno>{
+pub mod polling {
+    use std::os::fd::OwnedFd;
 
-    let connection = KVConnection{
-        fd: fd,
-        mtu: 1024,
-    };
+    use nix::{errno::Errno, sys::epoll::{Epoll, EpollEvent, EpollFlags}};
 
-    loop {
-        let result = match recv_all(&connection){
-            Ok(kvv) => kvv,
-            Err(Errno::ECONNRESET) => {
-                println!("worker #{} handle_connection: client disconnected", workerid);
-                break;
-            },
-            Err(e) => {
-                eprintln!("handle_connection recv_all: error {}", e);
-                return Err(e);
-            }
-        };
-    
-        let result_as_str = String::from_utf8(result.data).unwrap();
-        let mut parts = result_as_str.trim().splitn(3, ' ');
-    
-        let command = parts.next().unwrap_or("");
-        let key = parts.next().unwrap_or("");
-        let value = parts.next().unwrap_or("");
-    
-        match command {
-            "GET" => {
-                let msg = String::from("good get!").into_bytes();
-                send_all(&connection, msg).unwrap();
-                println!("worker #{}: handled GET", workerid);
-            },
-            "SET" => {
-                let msg = String::from("good set!").into_bytes();
-                send_all(&connection, msg).unwrap();
-                println!("worker #{}: handled SET", workerid);
-    
-            },
-            "DEL" => {
-                let msg = String::from("good del!").into_bytes();
-                send_all(&connection, msg).unwrap();
-                println!("worker #{}: handled DEL", workerid);
-    
-            },
-            _ => {
-                println!("handle_connection: received unknown command {}", result_as_str);
-            }
-        }
+    pub enum PollInterests {
+        ListeningSocket = 0,
+        TerminalInput = 1,
+        SIGINT = 2,
     }
 
-    Ok(())
+    pub fn kv_epoll_add(epoll: &Epoll, fd: &OwnedFd, flags: EpollFlags, interest: PollInterests) -> Result<(), Errno>{
+        epoll.add(fd, EpollEvent::new(flags, interest as u64))?;
+        Ok(())
+    }
 }
 
 pub mod threading {
     use std::ffi::c_void;
-    use kv_shared::ringbuffer::FdRingBuffer;
     use nix::libc::{pthread_t, pthread_create, pthread_self, pthread_detach};
-    use nix::errno::Errno;
+    use nix::errno::Errno;    
+    
+    /// Wrapper for libc::pthread_create, takes no attributes
+    pub fn kv_pthread_create(
+        thread: *mut pthread_t,  
+        thread_fn: extern "C" fn(*mut c_void) -> *mut c_void, 
+        fn_arg: *mut c_void 
+    ) -> Result<(), Errno>{
+        
+        let res = unsafe { 
+            pthread_create(thread, std::ptr::null(), thread_fn, fn_arg) 
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            let e = Errno::from_raw(res);
+            eprintln!("pthread_create: {}", e);
+            Err(e)
+        }
+    }
+    
+    /// Wrapper for libc::pthread_detach, detaches the calling thread
+    pub fn kv_pthread_detach() -> Result<(), Errno>{
+    
+        let tid = unsafe { pthread_self() };
+        let res = unsafe { pthread_detach(tid) };
+        if res == 0 {
+            Ok(())
+        } else {
+            let e = Errno::from_raw(res);
+            eprintln!("pthread_detach: {}", e);
+            Err(e)
+        }
+    }
+}
 
-    use crate::handle_connection;
+pub mod worker{
+    use std::{ffi::c_void, os::fd::OwnedFd};
+
+    use kv_shared::{io::{KVConnection, recv_all, send_all}, ringbuffer::FdRingBuffer};
+    use nix::errno::Errno;
+    
+    use crate::threading::kv_pthread_detach;
     
     /// Data passed as arg to worker_thread
     pub struct WorkerData<'a>{
@@ -138,37 +134,87 @@ pub mod threading {
     
         std::ptr::null_mut()
     }
+
+    fn handle_connection(fd: OwnedFd, workerid: u64) -> Result<(), Errno>{
     
-    /// Wrapper for libc::pthread_create, takes no attributes
-    pub fn kv_pthread_create(
-        thread: *mut pthread_t,  
-        thread_fn: extern "C" fn(*mut c_void) -> *mut c_void, 
-        fn_arg: *mut c_void 
-    ) -> Result<(), Errno>{
-    
-        let res = unsafe { 
-            pthread_create(thread, std::ptr::null(), thread_fn, fn_arg) 
+        let connection = KVConnection{
+            fd: fd,
+            mtu: 1024,
         };
-        if res == 0 {
-            Ok(())
-        } else {
-            let e = Errno::from_raw(res);
-            eprintln!("pthread_create: {}", e);
-            Err(e)
+    
+        #[allow(unused)]
+        'receive_commands: loop {
+            let result = match recv_all(&connection){
+                Ok(kvv) => kvv,
+                Err(Errno::ECONNRESET) => {
+                    println!("worker #{} handle_connection: client disconnected", workerid);
+                    break;
+                },
+                Err(e) => {
+                    eprintln!("handle_connection recv_all: error {}", e);
+                    return Err(e);
+                }
+            };
+        
+            let result_as_str = String::from_utf8(result.data).unwrap();
+            let mut parts = result_as_str.trim().splitn(3, ' ');
+        
+            let command = parts.next().unwrap_or("");
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+        
+            match command {
+                "GET" => {
+                    let msg = String::from("good get!").into_bytes();
+                    send_all(&connection, msg).unwrap();
+                    println!("worker #{}: handled GET", workerid);
+                },
+                "SET" => {
+                    let msg = String::from("good set!").into_bytes();
+                    send_all(&connection, msg).unwrap();
+                    println!("worker #{}: handled SET", workerid);
+        
+                },
+                "DEL" => {
+                    let msg = String::from("good del!").into_bytes();
+                    send_all(&connection, msg).unwrap();
+                    println!("worker #{}: handled DEL", workerid);
+        
+                },
+                _ => {
+                    println!("handle_connection: received unknown command {}", result_as_str);
+                }
+            }
         }
+    
+        Ok(())
     }
-    
-    /// Wrapper for libc::pthread_detach, detaches the calling thread
-    pub fn kv_pthread_detach() -> Result<(), Errno>{
-    
-        let tid = unsafe { pthread_self() };
-        let res = unsafe { pthread_detach(tid) };
-        if res == 0 {
-            Ok(())
-        } else {
-            let e = Errno::from_raw(res);
-            eprintln!("pthread_detach: {}", e);
-            Err(e)
+}
+
+pub mod signaling{
+    use std::{ffi::c_void, os::fd::{AsRawFd, OwnedFd, RawFd}};
+    use nix::{errno::Errno, libc::{O_NONBLOCK, c_int, pipe2, write}};
+    use nix::sys::signal::{Signal};
+
+    pub static mut PIPE_WRITE_FD: Option<RawFd> = None;
+
+
+    pub extern "C" fn handle_signal(signal: c_int) {
+        let signal = Signal::try_from(signal).unwrap();
+
+        /* write one bit to self-pipe */
+        if signal == Signal::SIGINT {
+            unsafe {
+                match PIPE_WRITE_FD {
+                    Some(fd) => {
+                        let mut nbytes: isize = 0;
+                        while nbytes == 0 {
+                            nbytes = write(fd, &1u8 as *const u8 as *const c_void, 1);
+                        }                        
+                    },
+                    None => {}
+                }
+            }
         }
     }
 }

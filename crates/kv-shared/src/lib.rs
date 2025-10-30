@@ -1,6 +1,6 @@
-use nix::sys::socket::{ send, recv, MsgFlags };
-use std::{os::fd::{ AsRawFd, OwnedFd, RawFd}, path::Path, u32};
-use nix::{libc, errno::Errno, libc::size_t};
+use nix::{sys::socket::{ MsgFlags, recv, send }};
+use std::{os::fd::{ AsRawFd, OwnedFd}, u32};
+use nix::{errno::Errno, libc::size_t};
 
 pub struct KVConnection{
     pub fd: OwnedFd,
@@ -89,15 +89,20 @@ pub fn send_all(connection: &KVConnection, msg: Vec<u8>) -> Result<(), Errno>{
 
 pub mod rbuf {
     use std::os::fd::{OwnedFd};
+    use nix::libc::{pthread_mutex_t, sem_t};
+
+    use crate::semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock, kv_sem_init, kv_sem_post, kv_sem_wait};
 
     /* todo: implement ring buffer */
     const RING_BUFFER_SIZE: usize = 4096 / std::mem::size_of::<Option<OwnedFd>>();
     pub struct FdRingBuffer {
         buf: Vec<Option<OwnedFd>>,
-        stored: usize,
         head: usize,
         tail: usize,
         mask: usize,
+        mtx: pthread_mutex_t,
+        items: sem_t,
+        spaces: sem_t,
     }
 
     impl FdRingBuffer {
@@ -106,37 +111,46 @@ pub mod rbuf {
             for _ in 0..RING_BUFFER_SIZE {
                 newbuf.push(None);
             }
+            
+            let mtx = kv_mutex_init().unwrap();
+            let items = kv_sem_init(0).unwrap();
+            let spaces = kv_sem_init(RING_BUFFER_SIZE).unwrap();
+
             Self {
                 buf: newbuf,
-                stored: 0,
                 head: 0,
                 tail: 0,
                 mask: 0xFFF,
+                mtx: mtx,
+                items: items,
+                spaces: spaces,
             }
         }
     
         pub fn put(&mut self, fd: OwnedFd) -> Result<(), OwnedFd>{
-            if self.stored == self.buf.len() {
-                return Err(fd)
-            }
+            kv_sem_wait(&mut self.spaces).unwrap();
+            kv_mutex_lock(&mut self.mtx).unwrap();
+
             let index = self.head & self.mask;
             self.buf[index] = Some(fd);
-
             self.head += 1;
-            self.stored += 1;
+
+            kv_mutex_unlock(&mut self.mtx).unwrap();
+            kv_sem_post(&mut self.items).unwrap();
+            
             Ok(())
         }   
 
         pub fn get(&mut self) -> Option<OwnedFd>{
-            if self.stored == 0 {
-                return None;
-            }
+            kv_sem_wait(&mut self.items).unwrap();
+            kv_mutex_lock(&mut self.mtx).unwrap();
 
             let index = self.tail & self.mask;
             let fd = self.buf[index].take()?;
-
             self.tail += 1;
-            self.stored -= 1;
+
+            kv_mutex_unlock(&mut self.mtx).unwrap();
+            kv_sem_post(&mut self.spaces).unwrap();
 
             Some(fd)
         }
@@ -144,4 +158,69 @@ pub mod rbuf {
 
 
     
+}
+
+pub mod semaphores{
+    use nix::{errno::Errno, libc::{pthread_mutex_init, pthread_mutex_lock, pthread_mutex_t, pthread_mutex_unlock, sem_init, sem_post, sem_t, sem_wait}};
+
+
+    /// Wrapper for phread_mutex_init()
+    pub fn kv_mutex_init() -> Result<pthread_mutex_t, Errno> {
+        let mut mtx: pthread_mutex_t = unsafe { std::mem::zeroed() };
+        let res = unsafe {pthread_mutex_init(&mut mtx, std::ptr::null())};
+        if res != 0 {
+            return Err(Errno::from_raw(res));
+        } 
+        Ok(mtx)
+    }
+    
+    /// Wrapper for pthread_mutex_lock()
+    pub fn kv_mutex_lock(mtx: &mut pthread_mutex_t) -> Result<(), Errno> {
+        let res = unsafe {pthread_mutex_lock(mtx)};
+        if res != 0 {
+            return Err(Errno::from_raw(res));
+        } 
+        Ok(())
+    }
+    
+    /// Wrapper for pthread_mutex_unlock()
+    pub fn kv_mutex_unlock(mtx: &mut pthread_mutex_t) -> Result<(), Errno> {
+        let res = unsafe {pthread_mutex_unlock(mtx)};
+        if res != 0 {
+            return Err(Errno::from_raw(res));
+        } 
+        Ok(())
+    }
+    
+    /// Wrapper for sem_init()
+    pub fn kv_sem_init(value: usize) -> Result<sem_t, Errno> {
+        let mut sem: sem_t = unsafe { std::mem::zeroed() };
+        let res = unsafe {
+            sem_init(&mut sem, 0 /*0 => shared between threads */, value as u32)};
+        if res == 0 {
+            Ok(sem)
+        } else {
+            Err(Errno::from_raw(Errno::last_raw()))
+        }
+    }
+    
+    /// Wrapper for sem_wait()
+    pub fn kv_sem_wait(sem: &mut sem_t) -> Result<(), Errno>{
+        let res = unsafe {sem_wait(sem)};
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(Errno::from_raw(Errno::last_raw()))
+        }
+    }
+    
+    /// Wrapper for sem_post()
+    pub fn kv_sem_post(sem: &mut sem_t) -> Result<(), Errno>{
+        let res = unsafe {sem_post(sem)};
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(Errno::from_raw(Errno::last_raw()))
+        }
+    }
 }

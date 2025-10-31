@@ -2,20 +2,19 @@
 use nix::sys::socket::{socket, connect, AddressFamily, SockFlag, SockType, UnixAddr};
 use std::os::fd::{AsRawFd};
 use nix::{errno::Errno};
-use kv_shared::io::{KVConnection, KVValue, recv_all, send_all};
+use kv_shared::io::{KVConnection, KVKey, KVMsg, KVMsgType};
 
-
-pub fn kvc_connect(sock_addr: UnixAddr) -> Result<KVConnection, Errno>{
-    
+pub fn new_client_kvconnection() -> Result<KVConnection, Errno>{
+    let sock_addr = UnixAddr::new("./kv.sock").unwrap();
     let sockfd = match socket(
-        AddressFamily::Unix, 
-        SockType::Stream,
+        nix::sys::socket::AddressFamily::Unix, 
+        nix::sys::socket::SockType::Stream,
         SockFlag::empty(),
         None, 
     ){
         Ok(fd) => fd,
         Err(e) => {
-            eprintln!("kv_client::kvc_connect socket error: {}", e);
+            eprintln!("new_as_client socket error: {}", e);
             return Err(e);
         }
     };
@@ -23,46 +22,56 @@ pub fn kvc_connect(sock_addr: UnixAddr) -> Result<KVConnection, Errno>{
     let _rc_conn = match connect(sockfd.as_raw_fd(), &sock_addr){
         Ok(rc) => rc,
         Err(e) => {
-            eprintln!("kv_client::kvc_connect connect error: {}", e);
+            eprintln!("new_as_client connect error: {}", e);
             return Err(e);
-        }
+        } 
     };
 
-    let connection = KVConnection {
+    return Ok(KVConnection {
         fd: sockfd,
         mtu: 1024,
+    });
+}
+
+pub fn kvc_get(connection: &mut KVConnection, key: &KVKey) -> Result<Vec<u8>, Errno> {
+
+    let msg = KVMsg::new(KVMsgType::Get, key.to_bytes());
+
+    match connection.send_kvmsg(msg){
+        Ok(y) => y,
+        Err(e) => return Err(e),
     };
-    return Ok(connection);
+    let response = connection.recv_kvmsg().unwrap();
+
+    Ok(response.msg)
 }
 
-pub fn kvc_get(connection: &KVConnection, key: &str) -> Result<KVValue, Errno> {
+pub fn kvc_set(connection: &mut KVConnection, key: &KVKey, value: &Vec<u8>) -> Result<Vec<u8>, Errno> {
 
-    // form msg
-    let msg = format!("GET {}", key).into_bytes();
+    /*todo: define a KVPAIR struct for serialization / deserialization? */
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend(key.to_bytes());
+    bytes.extend(value);
+    let msg = KVMsg::new(KVMsgType::Set, bytes);
 
-    send_all(connection, msg).unwrap();
-    let result = recv_all(connection).unwrap();
+    match connection.send_kvmsg(msg){
+        Ok(y) => y,
+        Err(e) => return Err(e),
+    };
+    let response = connection.recv_kvmsg().unwrap();
 
-    Ok(result)
+    /* todo: do something more specific here... */
+    Ok(response.msg)
 }
 
-pub fn kvc_set(connection: &KVConnection, key: &str, value: &str) -> Result<KVValue, Errno> {
+pub fn kvc_delete(connection: &mut KVConnection, key: &KVKey) -> Result<Vec<u8>, Errno>{
+    let msg = KVMsg::new(KVMsgType::Delete, key.to_bytes());
 
-    // do something better...
-    let msg = format!("SET {} {}", key, value).into_bytes();
+    match connection.send_kvmsg(msg){
+        Ok(y) => y,
+        Err(e) => return Err(e),
+    };
+    let response = connection.recv_kvmsg().unwrap();
 
-    send_all(connection, msg).unwrap();
-    let result = recv_all(connection).unwrap();
-
-    Ok(result)
-}
-
-pub fn kvc_delete(connection: &KVConnection, key: &str) -> Result<KVValue, Errno>{
-    // form msg
-    let msg = format!("DEL {}", key).into_bytes();
-
-    send_all(connection, msg).unwrap();
-    let result = recv_all(connection).unwrap();
-
-    Ok(result)
+    Ok(response.msg)
 }

@@ -83,12 +83,13 @@ fn main() -> Result<(), Errno> {
         };
         
         for event in events {
-            println!("server: got a {:?} event on Listening Socket", event.events());
             if event.data() == PollInterests::ListeningSocket as u64 {
+                println!("server: got a {:?} event on Listening Socket", event.events());
                 let listenfd = interestfds.get(&(PollInterests::ListeningSocket as u64)).unwrap();
                 accept_connection(listenfd, &mut rbuf).unwrap();
                 println!("server: put accepted connection to buffer");
             } else if event.data() == PollInterests::SIGINT as u64 {
+                println!("server: got a {:?} event on SIGINT", event.events());
                 break 'polling;
             } else {
                 println!("Got an unhandled {:?} with data {:?}", event.events(), event.data());

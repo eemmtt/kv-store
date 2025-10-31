@@ -1,91 +1,210 @@
 
 pub mod io {
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::{os::fd::{AsRawFd, OwnedFd},time::{Duration, SystemTime, UNIX_EPOCH}};
 
     use nix::{errno::Errno, libc::size_t, sys::socket::{MsgFlags, recv, send}};
+
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct KVKey {
+        data: [u8; 256],
+        len: usize,
+    }
+
+    impl KVKey {
+        pub const MAX_LEN: usize = 256;
+
+        pub fn new(s: &str) -> Result<Self, ()> {
+            if s.len() > Self::MAX_LEN {
+                return Err(());
+            }
+
+            let mut data = [0u8; Self::MAX_LEN];
+            data[..s.len()].copy_from_slice(s.as_bytes());
+            Ok(Self { 
+                data: data, 
+                len: s.len() 
+            })
+        }
+
+        pub fn as_str(&self) -> &str {
+            std::str::from_utf8(&self.data[..self.len]).unwrap()
+        }
+
+        pub fn to_bytes(&self) -> Vec<u8> {
+            let mut bytes: Vec<u8> = Vec::new();
+            bytes.extend(&self.data);
+            bytes.extend(&(self.len as u64).to_le_bytes());
+            bytes
+        }
+
+        pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
+            if bytes.len() < Self::MAX_LEN + 8 {
+                return Err(());
+            }
+            let data: [u8;Self::MAX_LEN] = bytes[..Self::MAX_LEN].try_into().unwrap();
+            let len = u64::from_le_bytes(bytes[Self::MAX_LEN..Self::MAX_LEN+8].try_into().unwrap()) as usize;
+            Ok(Self { data: data, len: len })
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    #[repr(u32)]
+    pub enum KVMsgType {
+        Get = 0,
+        Set = 1,
+        Delete = 2,
+        GetReturn = 3,
+        SetReturn = 4,
+        DeleteReturn = 5,
+    }
+
+    impl KVMsgType{
+        /* convert u32 to KVMsgType */
+        fn from_u32(val: u32) -> Result<Self, ()>{
+            match val {
+                0 => Ok(KVMsgType::Get),
+                1 => Ok(KVMsgType::Set),
+                2 => Ok(KVMsgType::Delete),
+                3 => Ok(KVMsgType::GetReturn),
+                4 => Ok(KVMsgType::SetReturn),
+                5 => Ok(KVMsgType::DeleteReturn),
+                _ => Err(()),
+            }
+        }
+    }
+    
+    pub struct KVMsg{
+        pub msgtype: KVMsgType,
+        pub sendtime: Duration,
+        pub msg: Vec<u8>,
+    }
+    
+    impl KVMsg{
+        pub fn new(msgtype: KVMsgType, msg: Vec<u8>) -> Self{
+            let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+            Self {
+                msgtype: msgtype, 
+                sendtime: t,
+                msg: msg,
+            }
+        }
+    
+        pub fn to_bytes(&self) -> Vec<u8> {
+            let mut bytes: Vec<u8> = Vec::new();
+            bytes.extend(&(self.msgtype as u32).to_le_bytes());         // 4 bytes
+            bytes.extend(&self.sendtime.as_secs().to_le_bytes());       // 8 bytes
+            bytes.extend(&self.sendtime.subsec_nanos().to_le_bytes());  // 4 bytes
+            bytes.extend(&(self.msg.len() as u64).to_le_bytes());       // 8 bytes
+            bytes.extend(&self.msg);                                    // 0 - ? bytes 
+            bytes
+        }
+        
+        pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
+            /* missing bytes, less than minimum */
+            if bytes.len() < 24 {
+                return Err(());
+            }
+            
+            let msgtype = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+            let secs = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+            let nanos = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+            let msglen = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+            
+            /* missing bytes from msg field */
+            if bytes.len() < 24 + msglen {
+                return Err(());
+            }
+            let msg: Vec<u8> = bytes[24..24+msglen].to_vec();
+            
+            Ok(KVMsg { 
+                msgtype: KVMsgType::from_u32(msgtype).unwrap(), 
+                sendtime: Duration::new(secs, nanos), 
+                msg: msg,
+            })
+            
+        }
+    } 
 
     pub struct KVConnection{
         pub fd: OwnedFd,
         pub mtu: size_t,
     }
     
-    pub struct KVValue{
-        pub data: Vec<u8>,
-        pub size: usize,
-    }
-    
-    /// Ensures full receipt of msg from KVConnection
-    pub fn recv_all(connection: &KVConnection) -> Result<KVValue, Errno>{
-    
-        // receive msg length
-        let mut len_buf= [0u8;4];
-        let mut nbytes_len_recvd: usize = 0;
-        while nbytes_len_recvd < len_buf.len() {
-            match recv(connection.fd.as_raw_fd(), &mut len_buf[nbytes_len_recvd..], MsgFlags::empty()){
-                Ok(0) => return Err(Errno::ECONNRESET),
-                Ok(n) => nbytes_len_recvd += n,
-                Err(e) => {
-                    eprintln!("kv_shared::kvs_recv_all recv msg.len() error: {}", e);
-                    return Err(e);
-                }
-            }
-        }
-    
-        // receive msg[length]
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; msg_len];
-        let mut nbytes_recvd: usize = 0;
-        while nbytes_recvd < msg_len {
-            match recv(connection.fd.as_raw_fd(), &mut buf[nbytes_recvd..], MsgFlags::empty()){
-                Ok(0) => return Err(Errno::ECONNRESET),
-                Ok(n) => nbytes_recvd += n,
-                Err(e) => {
-                    eprintln!("kv_shared::kvs_recv_all recv msg[len] error: {}", e);
-                    return Err(e);
-                }
-            }
-        }
-    
-        let result = KVValue {
-            data: buf,
-            size: nbytes_recvd,
-        };
-        Ok(result)
-    }
-    
-    
-    /// Ensures full send of msg from KVConnection
-    pub fn send_all(connection: &KVConnection, msg: Vec<u8>) -> Result<(), Errno>{
+    impl KVConnection{
         
-        if msg.len() > u32::MAX as usize {
-            return Err(Errno::EMSGSIZE);
-        }
-    
-        let len = msg.len() as u32;
-        let len_buf = len.to_be_bytes() as [u8; 4];
-        let mut nbytes_len_sent: usize = 0;
-        while nbytes_len_sent < 4 {
-            match send(connection.fd.as_raw_fd(), &len_buf[nbytes_len_sent..], MsgFlags::empty()){
-                Ok(n) => nbytes_len_sent += n,
-                Err(e) => {
-                    eprintln!("kv_shared::kvs_send_all send msg.len() error: {}", e);
-                    return Err(e);
+        /// Ensures full send of KVMsg over KVConnection
+        pub fn send_kvmsg(&mut self, msg: KVMsg) -> Result<(), Errno>{
+            
+            let msg_bytes = msg.to_bytes();
+            
+            /* send msg length over */
+            let msg_len = msg_bytes.len();
+            let len_buf = msg_len.to_be_bytes() as [u8; 8];
+            let mut nbytes_len_sent: usize = 0;
+            while nbytes_len_sent < 8 {
+                match send(self.fd.as_raw_fd(), &len_buf[nbytes_len_sent..], MsgFlags::empty()){
+                    Ok(n) => nbytes_len_sent += n,
+                    Err(e) => {
+                        eprintln!("io::send_kvmsg send msg_len error: {}", e);
+                        return Err(e);
+                    }
                 }
             }
-        }
-    
-        let mut nbytes_msg_sent: usize = 0;
-        while nbytes_msg_sent < msg.len() {
-             match send(connection.fd.as_raw_fd(), &msg[nbytes_msg_sent..], MsgFlags::empty()){
-                Ok(n) => nbytes_msg_sent += n,
-                Err(e) => {
-                    eprintln!("kv_shared::kvs_send_all send msg[len] error: {}", e);
-                    return Err(e);
+        
+            /* send msg */
+            let mut nbytes_msg_sent: usize = 0;
+            while nbytes_msg_sent < msg_len {
+                 match send(self.fd.as_raw_fd(), &msg_bytes[nbytes_msg_sent..], MsgFlags::empty()){
+                    Ok(n) => nbytes_msg_sent += n,
+                    Err(e) => {
+                        eprintln!("io::send_kvmsg send msg_bytes error: {}", e);
+                        return Err(e);
+                    }
                 }
             }
+        
+            Ok(())
         }
-    
-        Ok(())
+
+        /// Ensures full recv of KVMsg over KVConnection
+        pub fn recv_kvmsg(&mut self) -> Result<KVMsg, Errno>{
+        
+            /* receive msg length */ 
+            let mut len_buf= [0u8;8]; /* expecting usize */
+            let mut nbytes_len_recvd: usize = 0;
+            while nbytes_len_recvd < len_buf.len() {
+                match recv(self.fd.as_raw_fd(), &mut len_buf[nbytes_len_recvd..], MsgFlags::empty()){
+                    Ok(0) => return Err(Errno::ECONNRESET),
+                    Ok(n) => nbytes_len_recvd += n,
+                    Err(e) => {
+                        eprintln!("io::recv_kvmsg recv msg_len error: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+            let msg_len = u64::from_be_bytes(len_buf) as usize;
+            
+            /* receive msg */
+            let mut buf = vec![0u8; msg_len];
+            let mut nbytes_recvd: usize = 0;
+            while nbytes_recvd < msg_len {
+                match recv(self.fd.as_raw_fd(), &mut buf[nbytes_recvd..], MsgFlags::empty()){
+                    Ok(0) => return Err(Errno::ECONNRESET),
+                    Ok(n) => nbytes_recvd += n,
+                    Err(e) => {
+                        eprintln!("io::recv_all recv msg[len] error: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+        
+            let result = KVMsg::from_bytes(&buf).unwrap();
+            Ok(result)
+        }
+        
     }
 }
 

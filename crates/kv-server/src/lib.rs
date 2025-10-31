@@ -105,7 +105,7 @@ pub mod threading {
 pub mod worker{
     use std::{ffi::c_void, os::fd::OwnedFd};
 
-    use kv_shared::{io::{KVConnection, recv_all, send_all}, ringbuffer::FdRingBuffer};
+    use kv_shared::{io::{KVConnection, KVMsg, KVMsgType}, ringbuffer::FdRingBuffer};
     use nix::errno::Errno;
     
     use crate::threading::kv_pthread_detach;
@@ -137,17 +137,17 @@ pub mod worker{
 
     fn handle_connection(fd: OwnedFd, workerid: u64) -> Result<(), Errno>{
     
-        let connection = KVConnection{
+        let mut connection = KVConnection{
             fd: fd,
             mtu: 1024,
         };
     
         #[allow(unused)]
         'receive_commands: loop {
-            let result = match recv_all(&connection){
-                Ok(kvv) => kvv,
+            let msg = match connection.recv_kvmsg(){
+                Ok(msg) => msg,
                 Err(Errno::ECONNRESET) => {
-                    println!("worker #{} handle_connection: client disconnected", workerid);
+                    println!("worker #{}: client disconnected", workerid);
                     break;
                 },
                 Err(e) => {
@@ -156,33 +156,27 @@ pub mod worker{
                 }
             };
         
-            let result_as_str = String::from_utf8(result.data).unwrap();
-            let mut parts = result_as_str.trim().splitn(3, ' ');
-        
-            let command = parts.next().unwrap_or("");
-            let key = parts.next().unwrap_or("");
-            let value = parts.next().unwrap_or("");
-        
-            match command {
-                "GET" => {
-                    let msg = String::from("good get!").into_bytes();
-                    send_all(&connection, msg).unwrap();
+            match msg.msgtype {
+                KVMsgType::Get => {
+                    let body: Vec<u8> = String::from("good get!").into_bytes();
+                    let msg = KVMsg::new(KVMsgType::GetReturn, body);
+                    connection.send_kvmsg(msg).unwrap();
                     println!("worker #{}: handled GET", workerid);
                 },
-                "SET" => {
-                    let msg = String::from("good set!").into_bytes();
-                    send_all(&connection, msg).unwrap();
+                KVMsgType::Set => {
+                    let body: Vec<u8> = String::from("good set!").into_bytes();
+                    let msg = KVMsg::new(KVMsgType::SetReturn, body);
+                    connection.send_kvmsg(msg).unwrap();
                     println!("worker #{}: handled SET", workerid);
-        
                 },
-                "DEL" => {
-                    let msg = String::from("good del!").into_bytes();
-                    send_all(&connection, msg).unwrap();
+                KVMsgType::Delete => {
+                    let body: Vec<u8> = String::from("good del!").into_bytes();
+                    let msg = KVMsg::new(KVMsgType::DeleteReturn, body);
+                    connection.send_kvmsg(msg).unwrap();
                     println!("worker #{}: handled DEL", workerid);
-        
                 },
                 _ => {
-                    println!("handle_connection: received unknown command {}", result_as_str);
+                    println!("worker #{}: received unknown msg type", workerid);
                 }
             }
         }
@@ -192,13 +186,13 @@ pub mod worker{
 }
 
 pub mod signaling{
-    use std::{ffi::c_void, os::fd::{AsRawFd, OwnedFd, RawFd}};
-    use nix::{errno::Errno, libc::{O_NONBLOCK, c_int, pipe2, write}};
+    use std::{ffi::c_void, os::fd::{RawFd}};
+    use nix::libc::{ c_int, write};
     use nix::sys::signal::{Signal};
 
     pub static mut PIPE_WRITE_FD: Option<RawFd> = None;
 
-
+    /* this could probably just be handle_sigint */
     pub extern "C" fn handle_signal(signal: c_int) {
         let signal = Signal::try_from(signal).unwrap();
 

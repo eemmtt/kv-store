@@ -1,6 +1,7 @@
 
 pub mod io {
-    use std::{os::fd::{AsRawFd, OwnedFd},time::{Duration, SystemTime, UNIX_EPOCH}};
+    use core::time;
+    use std::{os::fd::{AsRawFd, OwnedFd}, str::from_utf8, time::{Duration, SystemTime, UNIX_EPOCH}};
 
     use nix::{errno::Errno, libc::size_t, sys::socket::{MsgFlags, recv, send}};
 
@@ -46,6 +47,90 @@ pub mod io {
             let len = u64::from_le_bytes(bytes[Self::MAX_LEN..Self::MAX_LEN+8].try_into().unwrap()) as usize;
             Ok(Self { data: data, len: len })
         }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[repr(u32)]
+    pub enum KVValueType {
+        Bytes = 0,
+        String = 1,
+    }
+
+    impl KVValueType {
+        fn from_u32(val: u32) -> Result<KVValueType, ()>{
+            match val {
+                0 => Ok(KVValueType::Bytes),
+                1 => Ok(KVValueType::String),
+                _ => Err(())
+            }
+        }
+    }
+
+    pub struct KVValue {
+        value_type: KVValueType,
+        time_set: Option<Duration>,
+        data: Vec<u8>,
+    }
+
+    impl KVValue {
+        pub fn new(value_type: KVValueType, data: Vec<u8>) -> Self{
+            Self {
+                value_type, 
+                time_set: None,
+                data
+            }
+        }
+
+        pub fn to_bytes(&self) -> Vec<u8>{
+            let mut bytes: Vec<u8> = Vec::new();
+            bytes.extend(&(self.value_type as u32).to_le_bytes());         // 4 bytes
+            if self.time_set.is_some() {
+                bytes.extend(&self.time_set.unwrap().as_secs().to_le_bytes());       // 8 bytes
+                bytes.extend(&self.time_set.unwrap().subsec_nanos().to_le_bytes());  // 4 bytes
+            } else {
+                bytes.extend((0 as u64).to_le_bytes());
+                bytes.extend((0 as u32).to_le_bytes());
+            }
+            bytes.extend(&(self.data.len() as u64).to_le_bytes());       // 8 bytes
+            bytes.extend(&self.data);                                    // 0 - ? bytes 
+            bytes
+        }
+
+        pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
+            /* missing bytes, less than minimum */
+            if bytes.len() < 24 {
+                return Err(());
+            }
+            
+            let value_type = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+            let secs = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+            let nanos = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+            let data_len = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+            
+            let is_time_set = secs > 0 || nanos > 0;
+            let time_set = match is_time_set{
+                true => Some(Duration::new(secs, nanos)),
+                false => None,
+            };
+
+            /* missing bytes from msg field */
+            if bytes.len() < 24 + data_len {
+                return Err(());
+            }
+            let data: Vec<u8> = bytes[24..24+data_len].to_vec();
+            
+            Ok(Self { 
+                value_type: KVValueType::from_u32(value_type).unwrap(), 
+                time_set, 
+                data,
+            })
+        }
+
+        pub fn to_string(&self) -> Result<String, ()>{
+            if self.value_type != KVValueType::String { return Err(())};
+            Ok(String::from_utf8(self.data.clone()).unwrap())
+        }
+
     }
 
     #[derive(Copy, Clone)]

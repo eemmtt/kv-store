@@ -105,7 +105,7 @@ pub mod threading {
 pub mod worker{
     use std::{ffi::c_void, os::fd::OwnedFd};
 
-    use kv_shared::{io::{KVConnection, KVMsg, KVMsgType}, ringbuffer::FdRingBuffer};
+    use kv_shared::{io::{KVConnection, KVMsg, KVMsgType, KVValue, KVValueType}, ringbuffer::FdRingBuffer};
     use nix::errno::Errno;
     
     use crate::threading::kv_pthread_detach;
@@ -159,7 +159,8 @@ pub mod worker{
             match msg.msgtype {
                 KVMsgType::Get => {
                     let body: Vec<u8> = String::from("good get!").into_bytes();
-                    let msg = KVMsg::new(KVMsgType::GetReturn, body);
+                    let value = KVValue::new(KVValueType::String, body).to_bytes();
+                    let msg = KVMsg::new(KVMsgType::GetReturn, value);
                     connection.send_kvmsg(msg).unwrap();
                     println!("worker #{}: handled GET", workerid);
                 },

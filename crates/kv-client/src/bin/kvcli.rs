@@ -1,4 +1,4 @@
-use kv_shared::io::KVKey;
+use kv_shared::io::{KVKey, KVValue, KVValueType};
 use nix::sys::socket::{UnixAddr};
 use nix::unistd::{close};
 use std::str::from_utf8;
@@ -14,12 +14,12 @@ fn main() {
     /* try GET */
     let get_key = KVKey::new("test").unwrap();
     let get_result = kvc_get(&mut connection, &get_key).unwrap();
-    let get_msg = from_utf8(&get_result).expect("invalid utf-8");
+    let get_msg = get_result.to_string().unwrap();
     println!("client: got '{}' from get()", get_msg);
 
     /* try SET */
     let set_key = KVKey::new("test").unwrap();
-    let set_val: Vec<u8> = "hello darling".as_bytes().to_vec();
+    let set_val = KVValue::new(KVValueType::String, "hello darling".as_bytes().to_vec());
     let set_result = kvc_set(&mut connection, &set_key, &set_val).unwrap();
     let set_msg = from_utf8(&set_result).expect("invalid utf-8");
     println!("client: got '{}' from set()", set_msg);

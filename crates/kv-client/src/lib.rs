@@ -2,7 +2,8 @@
 use nix::sys::socket::{socket, connect, AddressFamily, SockFlag, SockType, UnixAddr};
 use std::os::fd::{AsRawFd};
 use nix::{errno::Errno};
-use kv_shared::io::{KVConnection, KVKey, KVMsg, KVMsgType};
+use kv_shared::io::{KVConnection, KVKey, KVMsg, KVMsgType, KVValue};
+
 
 pub fn new_client_kvconnection() -> Result<KVConnection, Errno>{
     let sock_addr = UnixAddr::new("./kv.sock").unwrap();
@@ -33,7 +34,7 @@ pub fn new_client_kvconnection() -> Result<KVConnection, Errno>{
     });
 }
 
-pub fn kvc_get(connection: &mut KVConnection, key: &KVKey) -> Result<Vec<u8>, Errno> {
+pub fn kvc_get(connection: &mut KVConnection, key: &KVKey) -> Result<KVValue, Errno> {
 
     let msg = KVMsg::new(KVMsgType::Get, key.to_bytes());
 
@@ -42,16 +43,17 @@ pub fn kvc_get(connection: &mut KVConnection, key: &KVKey) -> Result<Vec<u8>, Er
         Err(e) => return Err(e),
     };
     let response = connection.recv_kvmsg().unwrap();
+    let value = KVValue::from_bytes(&response.msg).unwrap();
 
-    Ok(response.msg)
+    Ok(value)
 }
 
-pub fn kvc_set(connection: &mut KVConnection, key: &KVKey, value: &Vec<u8>) -> Result<Vec<u8>, Errno> {
+pub fn kvc_set(connection: &mut KVConnection, key: &KVKey, value: &KVValue) -> Result<Vec<u8>, Errno> {
 
     /*todo: define a KVPAIR struct for serialization / deserialization? */
     let mut bytes: Vec<u8> = Vec::new();
     bytes.extend(key.to_bytes());
-    bytes.extend(value);
+    bytes.extend(value.to_bytes());
     let msg = KVMsg::new(KVMsgType::Set, bytes);
 
     match connection.send_kvmsg(msg){

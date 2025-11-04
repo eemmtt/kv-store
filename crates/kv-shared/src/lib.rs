@@ -1,7 +1,7 @@
 
 pub mod io {
     use core::time;
-    use std::{os::fd::{AsRawFd, OwnedFd}, path::Path, str::from_utf8, time::{Duration, SystemTime, UNIX_EPOCH}};
+    use std::{fmt, os::fd::{AsRawFd, OwnedFd}, path::Path, str::from_utf8, time::{Duration, SystemTime, UNIX_EPOCH}};
 
     use nix::{errno::Errno, libc::{pthread_mutex_t, size_t}, sys::socket::{MsgFlags, UnixAddr, recv, send}};
 
@@ -306,6 +306,46 @@ pub mod io {
         pub time_added: Duration
     }
 
+    impl KVLogItem {
+        pub fn to_bytes(&self) -> Vec<u8> {
+            let mut bytes: Vec<u8> = Vec::new();
+            bytes.extend(&(self.file_offset as i64).to_le_bytes());
+            bytes.extend(&(self.data_size as u64).to_le_bytes());
+            bytes.extend(&(self.time_added.as_secs()).to_le_bytes());
+            bytes.extend(&(self.time_added.subsec_nanos()).to_le_bytes());
+            bytes
+        }
+
+        pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
+            if bytes.len() != 28 {
+                return Err(());
+            }
+
+            let file_offset = i64::from_le_bytes(bytes[0..8].try_into().unwrap()) as isize;
+            let data_size = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+            let dur_sec = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+            let dur_subsec_nanos = u32::from_le_bytes(bytes[24..].try_into().unwrap());
+
+            Ok(Self {
+                file_offset,
+                data_size,
+                time_added: Duration::new(dur_sec, dur_subsec_nanos),
+            })
+        }
+    }
+
+    impl fmt::Display for KVLogItem {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "LogItem(offset: {}, size: {}, time: {:?})",
+                self.file_offset,
+                self.data_size,
+                self.time_added
+            )
+        }
+    }
+
     pub struct KVLog{
         pub fd: OwnedFd,
         pub index: SyncdIndex,
@@ -457,13 +497,13 @@ pub mod semaphores{
 }
 
 pub mod syncdindex {
-    use std::collections::HashMap;
-    use nix::{errno::Errno, libc::pthread_mutex_t, sys::socket::sockopt::ReuseAddr};
+    use std::{collections::HashMap, path::Path};
+    use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socket::sockopt::ReuseAddr, stat::Mode}};
     use crate::{io::{KVKey, KVLogItem, KVValue}, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}};
 
 
     pub struct SyncdIndex {
-        map: HashMap<KVKey, KVLogItem>,
+        pub map: HashMap<KVKey, KVLogItem>,
         mtx: pthread_mutex_t,
     }
 
@@ -473,6 +513,92 @@ pub mod syncdindex {
                 map: HashMap::new(),
                 mtx: kv_mutex_init().unwrap(),
             }
+        }
+
+        pub fn from_file(path: &Path) -> Result<Self,Errno> {
+            /* open persisted index file */
+            let index_fd = match open(
+                path, 
+                OFlag::O_RDONLY,
+                Mode::S_IRWXU
+            ){
+                Ok(fd) => fd,
+                Err(Errno::ENOENT) => return Err(Errno::ENOENT),
+                Err(e) => {
+                    eprintln!("open unhandled error: {}", e);
+                    return Err(e);
+                }
+            };
+
+            let mut buf = [0u8; 4096 * 4];
+            let mut bytes_read = 0;
+            loop {
+                match nix::unistd::read(&index_fd, &mut buf){
+                    Ok(0) => break,
+                    Ok(n) => bytes_read += n,
+                    Err(e) => return Err(e),
+                }
+            }
+
+            /* invalid byte size, should be factor of 512 */
+            if bytes_read % 512 != 0 { return Err(Errno::EINVAL); } 
+
+            /* read entries into new hashmap */
+            let mut sindex = SyncdIndex::new();
+            let entries = bytes_read / 512;
+            for i in 0..entries{
+                let offset = i * 512;
+                let key = KVKey::from_bytes(&buf[offset..offset+264]).unwrap();
+                let item = KVLogItem::from_bytes(&buf[offset+264..offset+264+28]).unwrap();
+                match sindex.map.insert(key, item){
+                    None => None,
+                    Some(log_item) => {
+                        eprintln!("syncdindex::from_file, key already existed in map");
+                        Some(log_item)
+                    }
+                };
+            }
+
+            //println!("loaded index has {} entries", sindex.map.len());
+
+            Ok(sindex)
+
+        }
+
+        pub fn to_file(&self, path: &Path) -> Result<(), Errno>{
+            /* open file for persist */
+            let index_fd = open(
+                path, 
+                OFlag::O_WRONLY
+                | OFlag::O_TRUNC 
+                | OFlag::O_CREAT
+                | OFlag::O_APPEND, 
+                Mode::S_IRWXU
+            ).unwrap();
+            
+            //println!("syncdindex contains {} entries", self.map.len());
+
+            /* loop over map and append k:i to file */
+            for (key, item) in self.map.iter(){
+                /* pad up to 512 bytes, why not */
+                let mut bytes: Vec<u8> = Vec::new();
+                bytes.extend(key.to_bytes());   // 256 + 8          = 264
+                bytes.extend(item.to_bytes());  // 8 + 8 + 8 + 4    = 28
+                bytes.extend([0u8;220]);        // 220              = 220
+
+
+                let mut bytes_written = 0;
+                while bytes_written < bytes.len(){
+                    match nix::unistd::write(&index_fd, &bytes[bytes_written..]){
+                        Ok(n) => bytes_written += n,
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+
+            nix::unistd::close(index_fd).unwrap();
+            Ok(())
+            
         }
 
         pub fn si_insert(&mut self, key: KVKey, new_val: KVLogItem) -> Result<(),Errno>{

@@ -1,6 +1,6 @@
 //will contain implementations for CLI get, set, delete...
 use nix::sys::socket::{socket, connect, AddressFamily, SockFlag, SockType, UnixAddr};
-use std::os::fd::{AsRawFd};
+use std::{os::fd::AsRawFd, time::Duration};
 use nix::{errno::Errno};
 use kv_shared::io::{KVConnection, KVKey, KVMsg, KVMsgType, KVValue};
 
@@ -43,9 +43,15 @@ pub fn kvc_get(connection: &mut KVConnection, key: &KVKey) -> Result<KVValue, Er
         Err(e) => return Err(e),
     };
     let response = connection.recv_kvmsg().unwrap();
-    let value = KVValue::from_bytes(&response.msg).unwrap();
-
-    Ok(value)
+    if response.msg.len() > 0 {
+        let value = KVValue::from_bytes(&response.msg).unwrap();
+        return Ok(value);
+    } else {
+        return Ok(KVValue { 
+            value_type: kv_shared::io::KVValueType::String, 
+            time_set: None,
+            data: Vec::from("Couldn't get key") })
+    }
 }
 
 pub fn kvc_set(connection: &mut KVConnection, key: &KVKey, value: &KVValue) -> Result<Vec<u8>, Errno> {

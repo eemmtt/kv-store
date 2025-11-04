@@ -3,9 +3,10 @@ use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socke
 use kv_shared::{io::{KVKey, KVLog, KVLogItem, KVValue}, ringbuffer::FdRingBuffer, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}, syncdindex::SyncdIndex};
 
 /// Open log and load persisted index
-pub fn kv_log_load(log_path: &Path) -> Result<KVLog, Errno>{
+pub fn kv_log_load(storage_path: &Path) -> Result<KVLog, Errno>{
+    let log_path = storage_path.join("kvlog");
     let fd = match open(
-        log_path, 
+        &log_path, 
         OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_APPEND, 
         Mode::S_IRWXU,
     ){
@@ -15,8 +16,18 @@ pub fn kv_log_load(log_path: &Path) -> Result<KVLog, Errno>{
         }
     };
 
-    /* todo: load persisted index */
-    let index = SyncdIndex::new();
+    /* try to load persisted index */
+    let index_path = storage_path.join("kvindex");
+    let index = match SyncdIndex::from_file(&index_path){
+        Ok(si) => si,
+        Err(e) => {
+            eprintln!("failed to create syncdindex from file. Creating blank index instead");
+            SyncdIndex::new()
+        }
+    };
+    for (k,v) in index.map.iter(){
+        println!("{}:{}", k.as_str(), v);
+    }
 
     let mtx = kv_mutex_init().unwrap();
 
@@ -28,10 +39,16 @@ pub fn kv_log_load(log_path: &Path) -> Result<KVLog, Errno>{
 }
 
 /// Close log and persist index to file
-pub fn kv_log_shutdown(log: KVLog) -> Result<(), Errno>{
-    let _ = close(log.fd).unwrap();
+pub fn kv_log_shutdown(log: KVLog, storage_path: &Path) -> Result<(), Errno>{
+    
     /* todo: compact log */
-    /* todo: persist index */
+    
+    /* persist index */
+    let index_path = storage_path.join("kvindex");
+    log.index.to_file(&index_path).unwrap();
+
+    /* close log */
+    let _ = close(log.fd).unwrap();
 
     Ok(())
 }
@@ -81,16 +98,13 @@ pub fn kv_log_set(log: &mut KVLog, key: &KVKey, val: &KVValue) -> Result<(), Err
         let new_offset = lseek(&log.fd, 0, Whence::SeekEnd).unwrap();
         let mut bytes_written = 0;
         while bytes_written < data_size {
-            match nix::unistd::write(&log.fd, &val_as_bytes){
-                Ok(0) => break,
+            match nix::unistd::write(&log.fd, &val_as_bytes[bytes_written..]){
                 Ok(n) => bytes_written += n,
-                Err(e) => {
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
-        };
+        }
         kv_mutex_unlock(&mut log.mtx).unwrap();
-        
+    
         /* add logitem to index */
         let new_logitem = KVLogItem{
             file_offset: new_offset as isize,
@@ -98,7 +112,6 @@ pub fn kv_log_set(log: &mut KVLog, key: &KVKey, val: &KVValue) -> Result<(), Err
             time_added: val.time_set.expect("val.timeset is none?"),
         };
         log.index.si_insert(*key, new_logitem).unwrap();
-
         Ok(())
     } else {
         /* update KV pair */
@@ -114,8 +127,7 @@ pub fn kv_log_set(log: &mut KVLog, key: &KVKey, val: &KVValue) -> Result<(), Err
         let new_offset = lseek(&log.fd, 0, Whence::SeekEnd).unwrap();
         let mut bytes_written = 0;
         while bytes_written < data_size {
-            match nix::unistd::write(&log.fd, &val_as_bytes){
-                Ok(0) => break,
+            match nix::unistd::write(&log.fd, &val_as_bytes[bytes_written..]){
                 Ok(n) => bytes_written += n,
                 Err(e) => {
                     return Err(e);
@@ -308,7 +320,11 @@ pub mod worker{
                     println!("worker #{}: start SET", workerid);
                     let key = KVKey::from_bytes(&msg.msg[..264]).unwrap();
                     let mut val = KVValue::from_bytes(&msg.msg[264..]).unwrap();
-                    /* time needs to be passed over into value. the value vs. msg abstraction is not very good */
+                    /* 
+                        todo: rework msg / value abstraction
+                        value time is initialized to None 
+                        time from msg needs to be passed over into value
+                    */
                     val.time_set = Some(msg.sendtime); 
                     let result = kv_log_set(log, &key, &val).unwrap();
 

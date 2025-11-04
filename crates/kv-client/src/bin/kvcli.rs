@@ -11,6 +11,12 @@ fn main() {
     println!("client: start");
     let mut connection = new_client_kvconnection().unwrap();
 
+    /* try GET */
+    let get_key = KVKey::new("test").unwrap();
+    let get_result = kvc_get(&mut connection, &get_key).unwrap();
+    let get_msg = get_result.to_string().unwrap();
+    println!("client: got '{}' from get()", get_msg);
+
     /* try SET */
     let set_key = KVKey::new("test").unwrap();
     let set_val = KVValue::new(KVValueType::String, "hello darling".as_bytes().to_vec());

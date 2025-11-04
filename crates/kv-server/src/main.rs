@@ -22,8 +22,8 @@ fn main() -> Result<(), Errno> {
     println!("server: start");
 
     /* load log and index */
-    let log_path = Path::new("./kvlog");
-    let mut log = kv_log_load(log_path).unwrap();
+    let storage_path = Path::new("./storage");
+    let mut log = kv_log_load(storage_path).unwrap();
 
     /* init work ring buffer */
     let mut rbuf = FdRingBuffer::init();
@@ -106,7 +106,7 @@ fn main() -> Result<(), Errno> {
     println!("server: cleaning up");
     close(socket_fd).expect("close socket_fd failed");
     unlink(socket_path).expect("unlink failed");
-    kv_log_shutdown(log).expect("log_shutdown failed");
+    kv_log_shutdown(log, storage_path).expect("log_shutdown failed");
     println!("server: stop");
     Ok(())
 }

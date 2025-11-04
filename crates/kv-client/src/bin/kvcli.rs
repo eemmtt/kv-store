@@ -1,4 +1,5 @@
 use kv_shared::io::{KVKey, KVValue, KVValueType};
+use nix::errno::Errno;
 use nix::sys::socket::{UnixAddr};
 use nix::unistd::{close};
 use std::io::{self, Write};
@@ -9,7 +10,18 @@ fn main() {
     
     println!("client: start");
     println!("usage: [get|set|delete|exit] [key] [value]");
-    let mut connection = new_client_kvconnection().unwrap();
+    println!("--------");
+    let mut connection = match new_client_kvconnection(){
+        Ok(c) => c,
+        Err(Errno::ENOENT) => {
+            eprintln!("client: couldn't connect to server");
+            println!("client: stop");
+            return;
+        },
+        Err(e) => {
+            return;
+        }
+    };
 
     let stdin = io::stdin();
     loop{

@@ -15,7 +15,7 @@ pub fn new_client_kvconnection() -> Result<KVConnection, Errno>{
     ){
         Ok(fd) => fd,
         Err(e) => {
-            eprintln!("new_as_client socket error: {}", e);
+            eprintln!("new_client_kvconnection socket error: {}", e);
             return Err(e);
         }
     };
@@ -23,7 +23,7 @@ pub fn new_client_kvconnection() -> Result<KVConnection, Errno>{
     let _rc_conn = match connect(sockfd.as_raw_fd(), &sock_addr){
         Ok(rc) => rc,
         Err(e) => {
-            eprintln!("new_as_client connect error: {}", e);
+            eprintln!("new_client_kvconnection connect error: {}", e);
             return Err(e);
         } 
     };

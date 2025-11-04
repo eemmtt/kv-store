@@ -7,8 +7,6 @@ use kv_client::{kvc_delete, kvc_get, kvc_set, new_client_kvconnection };
 
 fn main() {
     
-    // todo get cli args, parse them..
-    
     println!("client: start");
     println!("usage: [get|set|delete|exit] [key] [value]");
     let mut connection = new_client_kvconnection().unwrap();

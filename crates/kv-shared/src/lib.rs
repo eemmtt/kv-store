@@ -135,7 +135,10 @@ pub mod io {
         }
 
         pub fn to_string(&self) -> Result<String, ()>{
-            if self.value_type != KVValueType::String { return Err(())};
+            if self.value_type != KVValueType::String { 
+                eprintln!("kvvalue.value_type is not string: {}", self.value_type as u32);
+                return Err(());
+            };
             Ok(String::from_utf8(self.data.clone()).unwrap())
         }
 

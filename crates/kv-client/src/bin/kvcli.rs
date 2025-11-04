@@ -50,8 +50,20 @@ fn main() {
                 }
                 let key = key.unwrap();
                 let get_key = KVKey::new(key).unwrap();
-                let get_result = kvc_get(&mut connection, &get_key).unwrap();
-                let get_msg = get_result.to_string().unwrap();
+                let get_result = match kvc_get(&mut connection, &get_key){
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("kvc_get failed: {}", e);
+                        break;
+                    }
+                };
+                let get_msg = match get_result.to_string(){
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("kvvalue::to_string failed");
+                        break;
+                    }
+                };
                 println!("client: got '{}' from key '{}'", get_msg, key);
             },
             "set" => {

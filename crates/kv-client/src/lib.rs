@@ -42,9 +42,9 @@ pub fn kvc_get(connection: &mut KVConnection, key: &KVKey) -> Result<KVValue, Er
         Ok(y) => y,
         Err(e) => return Err(e),
     };
-    let response = connection.recv_kvmsg().unwrap();
+    let response = connection.recv_kvmsg().expect("recv_kvmsg fail");
     if response.msg.len() > 0 {
-        let value = KVValue::from_bytes(&response.msg).unwrap();
+        let value = KVValue::from_bytes(&response.msg).expect("kvval from_bytes fail");
         return Ok(value);
     } else {
         return Ok(KVValue { 

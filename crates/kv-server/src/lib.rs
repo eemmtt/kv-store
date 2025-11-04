@@ -7,7 +7,7 @@ pub fn kv_log_load(storage_path: &Path) -> Result<KVLog, Errno>{
     let log_path = storage_path.join("kvlog");
     let fd = match open(
         &log_path, 
-        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_APPEND, 
+        OFlag::O_RDWR | OFlag::O_CREAT, 
         Mode::S_IRWXU,
     ){
         Ok(fd) => fd,
@@ -25,9 +25,11 @@ pub fn kv_log_load(storage_path: &Path) -> Result<KVLog, Errno>{
             SyncdIndex::new()
         }
     };
+    /*
     for (k,v) in index.map.iter(){
         println!("{}:{}", k.as_str(), v);
     }
+    */
 
     let mtx = kv_mutex_init().unwrap();
 
@@ -41,20 +43,94 @@ pub fn kv_log_load(storage_path: &Path) -> Result<KVLog, Errno>{
 /// Close log and persist index to file
 pub fn kv_log_shutdown(log: KVLog, storage_path: &Path) -> Result<(), Errno>{
     
-    /* todo: compact log */
+    /* compact log */
+    let compacted_log = kv_log_compact(log, storage_path).unwrap();
     
     /* persist index */
     let index_path = storage_path.join("kvindex");
-    log.index.to_file(&index_path).unwrap();
+    compacted_log.index.to_file(&index_path).unwrap();
 
     /* close log */
-    let _ = close(log.fd).unwrap();
+    let _ = close(compacted_log.fd).unwrap();
 
     Ok(())
 }
 
 /// Compact log file to most recent undeleted data
-pub fn kv_log_compact(){}
+pub fn kv_log_compact(log: KVLog, storage_path: &Path) -> Result<KVLog, Errno>{
+    /* init new log and index */
+    let new_log_path = storage_path.join("newlog");
+    let mut new_index = SyncdIndex::new();
+    let new_log_fd = open(
+        &new_log_path, 
+        OFlag::O_RDWR
+        | OFlag::O_CREAT,
+        Mode::S_IRWXU
+    ).expect("kv_log_compact open fail");
+
+    /* loop over old index, write all entries to new log and index */
+    for (key, item) in log.index.map.iter(){
+        /* read old val into buf */
+        let _old_offset = nix::unistd::lseek(&log.fd, item.file_offset as i64, Whence::SeekSet).unwrap();
+        let mut buf = vec![0u8;item.data_size];
+        let mut nbytes_read = 0;
+        loop {
+            match nix::unistd::read(&log.fd, &mut buf[nbytes_read..]){
+                Ok(0) => break,
+                Ok(n) => nbytes_read += n,
+                Err(e) => return Err(e),
+            }
+        }
+
+        /* write old val to end of new log */
+        let new_offset = nix::unistd::lseek(&new_log_fd, 0, Whence::SeekEnd).unwrap();
+        let mut nbytes_written = 0;
+        while nbytes_written < nbytes_read {
+            match nix::unistd::write(&new_log_fd, &buf[nbytes_written..nbytes_read]){
+                Ok(n) => nbytes_written += n,
+                Err(e) => return Err(e),
+            }
+        }
+
+        /* insert new item to new index */
+        let new_item = KVLogItem {
+            file_offset: new_offset as isize,
+            data_size: nbytes_written,
+            time_added: item.time_added,
+        };
+        if new_index.map.insert(*key, new_item).is_some(){
+            eprintln!("something weird happened with new index");
+            return Err(Errno::EALREADY);
+        }
+    }
+
+    /* rename old and new logs */
+    let log_old_path_init = storage_path.join("kvlog");
+    let log_old_path_fin = storage_path.join("kvlog_old");
+    let log_new_path_init = storage_path.join("newlog");
+    let log_new_path_fin = storage_path.join("kvlog");
+    nix::fcntl::renameat(
+        nix::fcntl::AT_FDCWD, 
+        &log_old_path_init, 
+        nix::fcntl::AT_FDCWD, 
+        &log_old_path_fin
+    ).expect("failed rename old log");
+    nix::fcntl::renameat(
+        nix::fcntl::AT_FDCWD, 
+        &log_new_path_init, 
+        nix::fcntl::AT_FDCWD, 
+        &log_new_path_fin
+    ).expect("failed rename new log");
+
+    /* cleanup old log */
+    nix::unistd::close(log.fd).unwrap();
+
+    Ok(KVLog{
+        fd: new_log_fd,
+        index: new_index,
+        mtx: kv_mutex_init().unwrap(),
+    })
+}
 
 /// Get value from log
 pub fn kv_log_get(log: &mut KVLog, key: &KVKey) -> Result<Option<KVValue>, Errno>{
@@ -69,9 +145,9 @@ pub fn kv_log_get(log: &mut KVLog, key: &KVKey) -> Result<Option<KVValue>, Errno
     kv_mutex_lock(&mut log.mtx).unwrap();
     lseek(&log.fd, logitem.file_offset as i64, Whence::SeekSet).unwrap();
     let mut bytes_read = 0;
-    let mut buf = [0u8; 4 * 4096]; /* todo: figure out real size... */
+    let mut buf = vec![0u8; logitem.data_size]; /* todo: figure out real size... */
     while bytes_read < logitem.data_size {
-        match nix::unistd::read(&log.fd, &mut buf) {
+        match nix::unistd::read(&log.fd, &mut buf[bytes_read..logitem.data_size]) {
             Ok(0) => break,
             Ok(n) => bytes_read += n,
             Err(e) => {
@@ -98,7 +174,7 @@ pub fn kv_log_set(log: &mut KVLog, key: &KVKey, val: &KVValue) -> Result<(), Err
         let new_offset = lseek(&log.fd, 0, Whence::SeekEnd).unwrap();
         let mut bytes_written = 0;
         while bytes_written < data_size {
-            match nix::unistd::write(&log.fd, &val_as_bytes[bytes_written..]){
+            match nix::unistd::write(&log.fd, &val_as_bytes[bytes_written..data_size]){
                 Ok(n) => bytes_written += n,
                 Err(e) => return Err(e),
             }
@@ -127,7 +203,7 @@ pub fn kv_log_set(log: &mut KVLog, key: &KVKey, val: &KVValue) -> Result<(), Err
         let new_offset = lseek(&log.fd, 0, Whence::SeekEnd).unwrap();
         let mut bytes_written = 0;
         while bytes_written < data_size {
-            match nix::unistd::write(&log.fd, &val_as_bytes[bytes_written..]){
+            match nix::unistd::write(&log.fd, &val_as_bytes[bytes_written..data_size]){
                 Ok(n) => bytes_written += n,
                 Err(e) => {
                     return Err(e);

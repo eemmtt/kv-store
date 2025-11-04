@@ -11,7 +11,7 @@ use std::os::fd::{ AsRawFd, OwnedFd, RawFd };
 use std::os::raw::c_void;
 use std::path::Path;
 
-use kv_server::{self, accept_connection, open_socket};
+use kv_server::{self, accept_connection, kv_log_load, kv_log_shutdown, open_socket};
 use kv_server::threading::{kv_pthread_create};
 use kv_server::worker::{WorkerData, worker_thread};
 use kv_server::polling::{PollInterests, kv_epoll_add};
@@ -20,6 +20,10 @@ use kv_server::signaling::{PIPE_WRITE_FD, handle_signal};
 
 fn main() -> Result<(), Errno> {
     println!("server: start");
+
+    /* load log and index */
+    let log_path = Path::new("./kvlog");
+    let mut log = kv_log_load(log_path).unwrap();
 
     /* init work ring buffer */
     let mut rbuf = FdRingBuffer::init();
@@ -31,6 +35,7 @@ fn main() -> Result<(), Errno> {
         let data = Box::new(WorkerData {
             id: i as u64,
             rbuf: &mut rbuf,
+            log: &mut log,
         });
         let arg = Box::into_raw(data) as *mut c_void;
         kv_pthread_create(&mut thread, worker_thread, arg).unwrap();
@@ -101,6 +106,7 @@ fn main() -> Result<(), Errno> {
     println!("server: cleaning up");
     close(socket_fd).expect("close socket_fd failed");
     unlink(socket_path).expect("unlink failed");
+    kv_log_shutdown(log).expect("log_shutdown failed");
     println!("server: stop");
     Ok(())
 }

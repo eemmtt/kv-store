@@ -1,15 +1,145 @@
 use std::{os::{fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}}, path::Path};
-use nix::{errno::Errno, sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, unistd::unlink};
-use kv_shared::{ringbuffer::FdRingBuffer};
+use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, stat::Mode}, unistd::{Whence, close, lseek, unlink}};
+use kv_shared::{io::{KVKey, KVLog, KVLogItem, KVValue}, ringbuffer::FdRingBuffer, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}, syncdindex::SyncdIndex};
+
+/// Open log and load persisted index
+pub fn kv_log_load(log_path: &Path) -> Result<KVLog, Errno>{
+    let fd = match open(
+        log_path, 
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_APPEND, 
+        Mode::S_IRWXU,
+    ){
+        Ok(fd) => fd,
+        Err(e) => {
+            return Err(e);
+        }
+    };
+
+    /* todo: load persisted index */
+    let index = SyncdIndex::new();
+
+    let mtx = kv_mutex_init().unwrap();
+
+    Ok(KVLog{
+        fd,
+        index,
+        mtx,
+    })
+}
+
+/// Close log and persist index to file
+pub fn kv_log_shutdown(log: KVLog) -> Result<(), Errno>{
+    let _ = close(log.fd).unwrap();
+    /* todo: compact log */
+    /* todo: persist index */
+
+    Ok(())
+}
+
+/// Compact log file to most recent undeleted data
+pub fn kv_log_compact(){}
 
 /// Get value from log
-pub fn log_get(){}
+pub fn kv_log_get(log: &mut KVLog, key: &KVKey) -> Result<Option<KVValue>, Errno>{
+    let logitem = match log.index.si_get(*key){
+        Some(li) => li,
+        None => {
+            return Ok(None);
+        }
+    };
+
+    /* seek to data location and read data_size bytes */
+    kv_mutex_lock(&mut log.mtx).unwrap();
+    lseek(&log.fd, logitem.file_offset as i64, Whence::SeekSet).unwrap();
+    let mut bytes_read = 0;
+    let mut buf = [0u8; 4 * 4096]; /* todo: figure out real size... */
+    while bytes_read < logitem.data_size {
+        match nix::unistd::read(&log.fd, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => bytes_read += n,
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+    kv_mutex_unlock(&mut log.mtx).unwrap();
+
+    let val = KVValue::from_bytes(&buf).unwrap();
+    Ok(Some(val))
+
+}
 
 /// Set key value pair in log
-pub fn log_set(){}
+pub fn kv_log_set(log: &mut KVLog, key: &KVKey, val: &KVValue) -> Result<(), Errno>{
+    let logitem = log.index.si_get(*key);
+    if logitem.is_none(){
+        /* add new KV pair */
+        /* append to log */
+        kv_mutex_lock(&mut log.mtx).unwrap();
+        let val_as_bytes = val.to_bytes();
+        let data_size = val_as_bytes.len();
+        let new_offset = lseek(&log.fd, 0, Whence::SeekEnd).unwrap();
+        let mut bytes_written = 0;
+        while bytes_written < data_size {
+            match nix::unistd::write(&log.fd, &val_as_bytes){
+                Ok(0) => break,
+                Ok(n) => bytes_written += n,
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        };
+        kv_mutex_unlock(&mut log.mtx).unwrap();
+        
+        /* add logitem to index */
+        let new_logitem = KVLogItem{
+            file_offset: new_offset as isize,
+            data_size: data_size,
+            time_added: val.time_set.expect("val.timeset is none?"),
+        };
+        log.index.si_insert(*key, new_logitem).unwrap();
+
+        Ok(())
+    } else {
+        /* update KV pair */
+        /* check that new value is fresh */
+        if logitem.unwrap().time_added > val.time_set.unwrap() {
+            return Err(Errno::ESTALE);
+        }
+
+        /* append to log */
+        kv_mutex_lock(&mut log.mtx).unwrap();
+        let val_as_bytes = val.to_bytes();
+        let data_size = val_as_bytes.len();
+        let new_offset = lseek(&log.fd, 0, Whence::SeekEnd).unwrap();
+        let mut bytes_written = 0;
+        while bytes_written < data_size {
+            match nix::unistd::write(&log.fd, &val_as_bytes){
+                Ok(0) => break,
+                Ok(n) => bytes_written += n,
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        };
+        kv_mutex_unlock(&mut log.mtx).unwrap();
+
+        /* update index */
+        let new_logitem = KVLogItem{
+            file_offset: new_offset as isize,
+            data_size: data_size,
+            time_added: val.time_set.expect("val.timeset is none?"),
+        };
+        log.index.si_insert(*key, new_logitem).unwrap();
+
+        Ok(())
+    }
+
+}
 
 /// Delete key value pair from log
-pub fn log_del(){}
+pub fn kv_log_del(){}
+
 
 /// Open unix tcp socket, bind and listen
 pub fn open_socket(path: &Path) -> Result<OwnedFd, Errno>{
@@ -105,15 +235,16 @@ pub mod threading {
 pub mod worker{
     use std::{ffi::c_void, os::fd::OwnedFd};
 
-    use kv_shared::{io::{KVConnection, KVMsg, KVMsgType, KVValue, KVValueType}, ringbuffer::FdRingBuffer};
+    use kv_shared::{io::{KVConnection, KVKey, KVLog, KVMsg, KVMsgType, KVValue, KVValueType}, ringbuffer::FdRingBuffer};
     use nix::errno::Errno;
     
-    use crate::threading::kv_pthread_detach;
+    use crate::{kv_log_get, kv_log_set, threading::kv_pthread_detach};
     
     /// Data passed as arg to worker_thread
     pub struct WorkerData<'a>{
         pub id: u64,
         pub rbuf: &'a mut FdRingBuffer,
+        pub log: &'a mut KVLog,
     }
     
     /// start routine for worker threads
@@ -122,6 +253,7 @@ pub mod worker{
         let data = unsafe { Box::from_raw(arg as *mut WorkerData)};
         println!("Hello from worker thread #{}!", data.id);
 
+        /* lock with timeout, check for shutdown flag */
         loop {
             let fd = match data.rbuf.get(){
                 Some(fd) => fd,
@@ -129,13 +261,13 @@ pub mod worker{
                     continue;
                 }
             };
-            handle_connection(fd,data.id).expect("oops at handle_connection");
+            handle_connection(fd, data.log,data.id).expect("oops at handle_connection");
         }
     
         std::ptr::null_mut()
     }
 
-    fn handle_connection(fd: OwnedFd, workerid: u64) -> Result<(), Errno>{
+    fn handle_connection(fd: OwnedFd, log: &mut KVLog, workerid: u64) -> Result<(), Errno>{
     
         let mut connection = KVConnection{
             fd: fd,
@@ -158,19 +290,35 @@ pub mod worker{
         
             match msg.msgtype {
                 KVMsgType::Get => {
-                    let body: Vec<u8> = String::from("good get!").into_bytes();
-                    let value = KVValue::new(KVValueType::String, body).to_bytes();
-                    let msg = KVMsg::new(KVMsgType::GetReturn, value);
+                    println!("worker #{}: start GET", workerid);
+                    let key = KVKey::from_bytes(&msg.msg).unwrap();
+                    let val = match kv_log_get(log, &key){
+                        Ok(None) => Vec::new(),
+                        Ok(v) => v.unwrap().to_bytes(),
+                        Err(e) => {
+                            eprint!("kv_log_get err: {}", e);
+                            return Err(e);
+                        }
+                    };
+                    let msg = KVMsg::new(KVMsgType::GetReturn, val);
                     connection.send_kvmsg(msg).unwrap();
                     println!("worker #{}: handled GET", workerid);
                 },
-                KVMsgType::Set => {
+                KVMsgType::Set => {                     
+                    println!("worker #{}: start SET", workerid);
+                    let key = KVKey::from_bytes(&msg.msg[..264]).unwrap();
+                    let mut val = KVValue::from_bytes(&msg.msg[264..]).unwrap();
+                    /* time needs to be passed over into value. the value vs. msg abstraction is not very good */
+                    val.time_set = Some(msg.sendtime); 
+                    let result = kv_log_set(log, &key, &val).unwrap();
+
                     let body: Vec<u8> = String::from("good set!").into_bytes();
                     let msg = KVMsg::new(KVMsgType::SetReturn, body);
                     connection.send_kvmsg(msg).unwrap();
                     println!("worker #{}: handled SET", workerid);
                 },
                 KVMsgType::Delete => {
+                    println!("worker #{}: start DEL", workerid);
                     let body: Vec<u8> = String::from("good del!").into_bytes();
                     let msg = KVMsg::new(KVMsgType::DeleteReturn, body);
                     connection.send_kvmsg(msg).unwrap();

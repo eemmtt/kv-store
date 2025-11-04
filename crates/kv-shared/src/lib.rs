@@ -1,9 +1,11 @@
 
 pub mod io {
     use core::time;
-    use std::{os::fd::{AsRawFd, OwnedFd}, str::from_utf8, time::{Duration, SystemTime, UNIX_EPOCH}};
+    use std::{os::fd::{AsRawFd, OwnedFd}, path::Path, str::from_utf8, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-    use nix::{errno::Errno, libc::size_t, sys::socket::{MsgFlags, recv, send}};
+    use nix::{errno::Errno, libc::{pthread_mutex_t, size_t}, sys::socket::{MsgFlags, UnixAddr, recv, send}};
+
+    use crate::syncdindex::SyncdIndex;
 
 
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,9 +69,9 @@ pub mod io {
     }
 
     pub struct KVValue {
-        value_type: KVValueType,
-        time_set: Option<Duration>,
-        data: Vec<u8>,
+        pub value_type: KVValueType,
+        pub time_set: Option<Duration>,
+        pub data: Vec<u8>,
     }
 
     impl KVValue {
@@ -120,7 +122,13 @@ pub mod io {
             let data: Vec<u8> = bytes[24..24+data_len].to_vec();
             
             Ok(Self { 
-                value_type: KVValueType::from_u32(value_type).unwrap(), 
+                value_type: match KVValueType::from_u32(value_type){
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("value type = {}", value_type);
+                        return Err(());
+                    }
+                }, 
                 time_set, 
                 data,
             })
@@ -291,6 +299,18 @@ pub mod io {
         }
         
     }
+
+    pub struct KVLogItem {
+        pub file_offset: isize,
+        pub data_size: usize,
+        pub time_added: Duration
+    }
+
+    pub struct KVLog{
+        pub fd: OwnedFd,
+        pub index: SyncdIndex,
+        pub mtx: pthread_mutex_t,
+    }
 }
 
 
@@ -433,5 +453,128 @@ pub mod semaphores{
         } else {
             Err(Errno::from_raw(Errno::last_raw()))
         }
+    }
+}
+
+pub mod syncdindex {
+    use std::collections::HashMap;
+    use nix::{errno::Errno, libc::pthread_mutex_t, sys::socket::sockopt::ReuseAddr};
+    use crate::{io::{KVKey, KVLogItem, KVValue}, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}};
+
+
+    pub struct SyncdIndex {
+        map: HashMap<KVKey, KVLogItem>,
+        mtx: pthread_mutex_t,
+    }
+
+    impl SyncdIndex {
+        pub fn new() -> Self {
+            Self {
+                map: HashMap::new(),
+                mtx: kv_mutex_init().unwrap(),
+            }
+        }
+
+        pub fn si_insert(&mut self, key: KVKey, new_val: KVLogItem) -> Result<(),Errno>{
+            kv_mutex_lock(&mut self.mtx).unwrap();
+            match self.map.get(&key){
+                Some(v) => {
+                    /* only update k:v if newer */
+                    if v.time_added < new_val.time_added {
+                        self.map.insert(key, new_val);
+                    }
+                },
+                None => {
+                    self.map.insert(key, new_val);
+                }
+            }
+            kv_mutex_unlock(&mut self.mtx).unwrap();
+            Ok(())
+        }
+
+        pub fn si_get(&mut self, key: KVKey) -> Option<&KVLogItem>{
+            kv_mutex_lock(&mut self.mtx).unwrap();
+            let result = self.map.get(&key);
+            kv_mutex_unlock(&mut self.mtx).unwrap();
+            result
+        }
+
+    }
+
+}
+
+pub mod maxheap {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub struct HeapNode{
+        pub index: usize,
+        pub value:  Duration,
+        pub parent: Option<usize>,
+        pub left:   Option<usize>,
+        pub right:  Option<usize>,
+    }
+
+    impl HeapNode{
+        pub fn new(val: Duration, index: usize) -> Self {
+            Self {index, value: val, parent: None, left: None, right: None }
+        }
+    }
+ 
+    pub struct MaxTimeHeap {
+        nodes: Vec<HeapNode>,
+        root: Option<usize>,
+    }
+
+    impl MaxTimeHeap {
+        pub fn new() -> Self {
+            Self { nodes: Vec::new(), root: None }
+        }
+
+        /* add new node between parent and child */
+        fn heap_insert(&mut self, new_val: Duration, parent: Option<HeapNode>, child: Option<HeapNode>){
+
+            let new_node_index =  self.nodes.len();
+            if parent.is_none() {
+                /* new root */
+                /* wip...
+                self.root = Some(new_node_index);
+                self.nodes.push(HeapNode::new(new_val, self.nodes.len()));
+                self.nodes[new_node_index].left = Some(&child.unwrap().index);
+                self.nodes[child.unwrap().index].parent = Some(new_node_index);
+                 */
+
+            } else if child.is_none() {
+                /* new leaf */
+            } else {
+                /* inserting between parent and child */
+
+            }
+
+
+        }
+
+        pub fn push(&mut self, val: Duration){
+            /* heap is empty */
+            if self.root.is_none() {
+                self.root = Some(self.nodes.len());
+                self.nodes.push(HeapNode::new(val, self.nodes.len()));
+                return;
+            } else {
+                /* heap is not empty, add leaf */
+                /* wip...
+                let mut curr_nodes: Vec<&HeapNode> = vec![&self.nodes[self.root.unwrap()]];
+                loop {
+                    for node in curr_nodes{
+                        if val > node.value {
+                            //heap_insert(self, val, None, Some(node));
+                        }
+                    }
+                }
+                 */
+                    
+            }
+        }
+
+
     }
 }

@@ -1,3 +1,4 @@
+use kv_shared::io::KVKey;
 use kv_shared::ringbuffer::FdRingBuffer;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
@@ -7,6 +8,7 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::unistd::{close, pipe2, unlink};
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::fd::{ AsRawFd, OwnedFd, RawFd };
 use std::os::raw::c_void;
 use std::path::Path;
@@ -29,7 +31,7 @@ fn main() -> Result<(), Errno> {
     let mut rbuf = FdRingBuffer::init();
     
     /* init worker thread pool */
-    const THREAD_POOL_SIZE: usize = nix::unistd::sysc;
+    const THREAD_POOL_SIZE: usize = 4; /* todo: spawn thread for each core - 1 */
     for i in 0..THREAD_POOL_SIZE {
         let mut thread = 0 as pthread_t;
         let data = Box::new(WorkerData {

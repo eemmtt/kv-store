@@ -1,4 +1,4 @@
-use kv_shared::io::{KVKey, KVValue, KVValueType};
+use kv_shared::io::{KVKey, KVValue};
 use nix::errno::Errno;
 use nix::sys::socket::{UnixAddr};
 use nix::unistd::{close};
@@ -9,7 +9,7 @@ use kv_client::{kvc_delete, kvc_get, kvc_set, new_client_kvconnection };
 fn main() {
     
     println!("client: start");
-    println!("usage: [get|set|delete|exit] [key] [value]");
+    println!("usage:\n\tget <key>\n|\tset <key> <value>\n|\tdelete <key>\n|\texit");
     println!("--------");
     let mut connection = match new_client_kvconnection(){
         Ok(c) => c,
@@ -35,7 +35,7 @@ fn main() {
         let command = match input_split.next(){
             Some(v) => v,
             None => {
-                println!("bad command, try again?");
+                println!("bad command");
                 continue;
             }
         };
@@ -50,21 +50,14 @@ fn main() {
                 }
                 let key = key.unwrap();
                 let get_key = KVKey::new(key).unwrap();
-                let get_result = match kvc_get(&mut connection, &get_key){
+                let get_result = match kvc_get(&mut connection, get_key){
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("kvc_get failed: {}", e);
                         break;
                     }
                 };
-                let get_msg = match get_result.to_string(){
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("kvvalue::to_string failed");
-                        break;
-                    }
-                };
-                println!("client: got '{}' from key '{}'", get_msg, key);
+                println!("get: '{}'", get_result.as_str());
             },
             "set" => {
                 if key.is_none(){ 
@@ -77,10 +70,9 @@ fn main() {
                 }
                 let key = key.unwrap();
                 let set_key = KVKey::new(key).unwrap();
-                let set_val = KVValue::new(KVValueType::String, value.as_bytes().to_vec());
-                let set_result = kvc_set(&mut connection, &set_key, &set_val).unwrap();
-                let set_msg = from_utf8(&set_result).expect("invalid utf-8");
-                println!("client: got '{}' from setting key '{}'", set_msg, key);
+                let set_val = KVValue::new(&value).unwrap();
+                let set_result = kvc_set(&mut connection, set_key, set_val).unwrap();
+                println!("set: '{}'", set_result.as_str());
             },
             "delete" => {
                 if key.is_none(){ 
@@ -89,9 +81,8 @@ fn main() {
                 }
                 let key = key.unwrap();
                 let del_key = KVKey::new(key).unwrap();
-                let del_result = kvc_delete(&mut connection, &del_key).unwrap();
-                let del_msg = from_utf8(&del_result).expect("invalid utf-8");
-                println!("client: got '{}' from deleting key '{}'", del_msg, key);
+                let del_result = kvc_delete(&mut connection, del_key).unwrap();
+                println!("delete: '{}'", del_result.as_str());
             },
             "exit" => {
                 break;

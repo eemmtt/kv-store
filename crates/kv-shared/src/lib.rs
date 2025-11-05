@@ -1,28 +1,29 @@
 
 pub mod io {
-    use core::time;
     use std::{fmt, os::fd::{AsRawFd, OwnedFd}, path::Path, str::from_utf8, time::{Duration, SystemTime, UNIX_EPOCH}};
-
     use nix::{errno::Errno, libc::{pthread_mutex_t, size_t}, sys::socket::{MsgFlags, UnixAddr, recv, send}};
-
     use crate::syncdindex::SyncdIndex;
 
+    pub const USIZE_SIZE: usize = std::mem::size_of::<usize>();
+    pub const KEY_SIZE: usize = 256;
+    pub const VAL_SIZE: usize = 2048;
+    pub const MSG_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u32>() + KEY_SIZE + VAL_SIZE;
 
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub struct KVKey {
-        data: [u8; 256],
         len: usize,
+        data: [u8; KEY_SIZE - USIZE_SIZE], /* fits in 256 bytes */
     }
 
     impl KVKey {
-        pub const MAX_LEN: usize = 256;
+        const DATA_SIZE: usize = KEY_SIZE - USIZE_SIZE;
 
         pub fn new(s: &str) -> Result<Self, ()> {
-            if s.len() > Self::MAX_LEN {
+            if s.len() > Self::DATA_SIZE {
                 return Err(());
             }
 
-            let mut data = [0u8; Self::MAX_LEN];
+            let mut data = [0u8; Self::DATA_SIZE];
             data[..s.len()].copy_from_slice(s.as_bytes());
             Ok(Self { 
                 data: data, 
@@ -34,112 +35,68 @@ pub mod io {
             std::str::from_utf8(&self.data[..self.len]).unwrap()
         }
 
-        pub fn to_bytes(&self) -> Vec<u8> {
-            let mut bytes: Vec<u8> = Vec::new();
-            bytes.extend(&self.data);
-            bytes.extend(&(self.len as u64).to_le_bytes());
+        pub fn to_bytes(&self) -> [u8;KEY_SIZE] {
+            let mut bytes = [0u8; KEY_SIZE];
+            bytes[..USIZE_SIZE].copy_from_slice(&self.len.to_le_bytes());
+            bytes[USIZE_SIZE..].copy_from_slice(&self.data);
             bytes
         }
 
         pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
-            if bytes.len() < Self::MAX_LEN + 8 {
+            if bytes.len() != KEY_SIZE {
+                eprintln!("KVKey::from_bytes expected {} bytes but got {}.", KEY_SIZE, bytes.len());
                 return Err(());
             }
-            let data: [u8;Self::MAX_LEN] = bytes[..Self::MAX_LEN].try_into().unwrap();
-            let len = u64::from_le_bytes(bytes[Self::MAX_LEN..Self::MAX_LEN+8].try_into().unwrap()) as usize;
+            let len = usize::from_le_bytes(bytes[..USIZE_SIZE].try_into().unwrap());
+            let data: [u8;Self::DATA_SIZE] = bytes[USIZE_SIZE..KEY_SIZE].try_into().unwrap();
             Ok(Self { data: data, len: len })
         }
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    #[repr(u32)]
-    pub enum KVValueType {
-        Bytes = 0,
-        String = 1,
-    }
-
-    impl KVValueType {
-        fn from_u32(val: u32) -> Result<KVValueType, ()>{
-            match val {
-                0 => Ok(KVValueType::Bytes),
-                1 => Ok(KVValueType::String),
-                _ => Err(())
-            }
-        }
-    }
-
     pub struct KVValue {
-        pub value_type: KVValueType,
-        pub time_set: Option<Duration>,
-        pub data: Vec<u8>,
+        len: usize,
+        data: [u8; VAL_SIZE - USIZE_SIZE], /* fits in 2048 bytes */
     }
 
     impl KVValue {
-        pub fn new(value_type: KVValueType, data: Vec<u8>) -> Self{
-            Self {
-                value_type, 
-                time_set: None,
-                data
+        const DATA_SIZE: usize = VAL_SIZE - USIZE_SIZE;
+
+        pub fn new(s: &str) -> Result<Self, ()>{
+            if s.len() > Self::DATA_SIZE {
+                return Err(());
             }
+
+            let mut data = [0u8; Self::DATA_SIZE];
+            data[..s.len()].copy_from_slice(s.as_bytes());
+            Ok(Self { 
+                len: s.len(),
+                data: data, 
+            })
         }
 
-        pub fn to_bytes(&self) -> Vec<u8>{
-            let mut bytes: Vec<u8> = Vec::new();
-            bytes.extend(&(self.value_type as u32).to_le_bytes());         // 4 bytes
-            if self.time_set.is_some() {
-                bytes.extend(&self.time_set.unwrap().as_secs().to_le_bytes());       // 8 bytes
-                bytes.extend(&self.time_set.unwrap().subsec_nanos().to_le_bytes());  // 4 bytes
-            } else {
-                bytes.extend((0 as u64).to_le_bytes());
-                bytes.extend((0 as u32).to_le_bytes());
-            }
-            bytes.extend(&(self.data.len() as u64).to_le_bytes());       // 8 bytes
-            bytes.extend(&self.data);                                    // 0 - ? bytes 
+        pub fn to_bytes(&self) -> [u8;VAL_SIZE]{
+            let mut bytes= [0u8; VAL_SIZE];
+            bytes[..USIZE_SIZE].copy_from_slice(&self.len.to_le_bytes());
+            bytes[USIZE_SIZE..].copy_from_slice(&self.data);
             bytes
         }
 
         pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
-            /* missing bytes, less than minimum */
-            if bytes.len() < 24 {
+            if bytes.len() != VAL_SIZE {
+                eprintln!("KVVal::from_bytes expected {} bytes but got {}.", VAL_SIZE, bytes.len());
                 return Err(());
             }
-            
-            let value_type = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-            let secs = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
-            let nanos = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-            let data_len = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
-            
-            let is_time_set = secs > 0 || nanos > 0;
-            let time_set = match is_time_set{
-                true => Some(Duration::new(secs, nanos)),
-                false => None,
-            };
-
-            /* missing bytes from msg field */
-            if bytes.len() < 24 + data_len {
-                return Err(());
-            }
-            let data: Vec<u8> = bytes[24..24+data_len].to_vec();
+            let data_len = usize::from_le_bytes(bytes[..USIZE_SIZE].try_into().unwrap());
+            let data: [u8; Self::DATA_SIZE] = bytes[USIZE_SIZE..VAL_SIZE].try_into().unwrap();
             
             Ok(Self { 
-                value_type: match KVValueType::from_u32(value_type){
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("value type = {}", value_type);
-                        return Err(());
-                    }
-                }, 
-                time_set, 
+                len: data_len,
                 data,
             })
         }
 
-        pub fn to_string(&self) -> Result<String, ()>{
-            if self.value_type != KVValueType::String { 
-                eprintln!("kvvalue.value_type is not string: {}", self.value_type as u32);
-                return Err(());
-            };
-            Ok(String::from_utf8(self.data.clone()).unwrap())
+        pub fn as_str(&self) -> &str {
+            std::str::from_utf8(&self.data[..self.len]).unwrap()
         }
 
     }
@@ -172,53 +129,56 @@ pub mod io {
     
     pub struct KVMsg{
         pub msgtype: KVMsgType,
-        pub sendtime: Duration,
-        pub msg: Vec<u8>,
-    }
+        pub sendtime: Duration, 
+        pub data: [u8;KEY_SIZE + VAL_SIZE],
+    } 
     
     impl KVMsg{
-        pub fn new(msgtype: KVMsgType, msg: Vec<u8>) -> Self{
+        const DATA_SIZE: usize = KEY_SIZE + VAL_SIZE;
+
+        pub fn new(msgtype: KVMsgType, key: KVKey, val: KVValue) -> Self{
             let t = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap();
+
+            let mut data = [0u8;KEY_SIZE + VAL_SIZE];
+            data[..KEY_SIZE].copy_from_slice(&key.to_bytes());
+            data[KEY_SIZE..].copy_from_slice(&val.to_bytes());
             Self {
                 msgtype: msgtype, 
                 sendtime: t,
-                msg: msg,
+                data,
             }
         }
     
-        pub fn to_bytes(&self) -> Vec<u8> {
-            let mut bytes: Vec<u8> = Vec::new();
-            bytes.extend(&(self.msgtype as u32).to_le_bytes());         // 4 bytes
-            bytes.extend(&self.sendtime.as_secs().to_le_bytes());       // 8 bytes
-            bytes.extend(&self.sendtime.subsec_nanos().to_le_bytes());  // 4 bytes
-            bytes.extend(&(self.msg.len() as u64).to_le_bytes());       // 8 bytes
-            bytes.extend(&self.msg);                                    // 0 - ? bytes 
+        pub fn to_bytes(&self) -> [u8;MSG_SIZE] {
+            let mut bytes = [0u8;MSG_SIZE];
+            let sec_offset = size_of::<u32>();
+            let nan_offset = sec_offset + size_of::<u64>();
+            let msg_offset = nan_offset + size_of::<u32>();
+
+            bytes[..size_of::<u32>()].copy_from_slice(&(self.msgtype as u32).to_le_bytes());
+            bytes[sec_offset..nan_offset].copy_from_slice(&self.sendtime.as_secs().to_le_bytes());
+            bytes[nan_offset..msg_offset].copy_from_slice(&self.sendtime.subsec_nanos().to_le_bytes());
+            bytes[msg_offset..].copy_from_slice(&self.data);
             bytes
         }
         
         pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
-            /* missing bytes, less than minimum */
-            if bytes.len() < 24 {
+            if bytes.len() != MSG_SIZE {
+                eprintln!("KVMsg::from_bytes expected {} bytes but got {}.", MSG_SIZE, bytes.len());
                 return Err(());
             }
             
             let msgtype = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
             let secs = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
             let nanos = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-            let msglen = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
-            
-            /* missing bytes from msg field */
-            if bytes.len() < 24 + msglen {
-                return Err(());
-            }
-            let msg: Vec<u8> = bytes[24..24+msglen].to_vec();
+            let data: [u8; Self::DATA_SIZE] = bytes[16..].try_into().unwrap();
             
             Ok(KVMsg { 
                 msgtype: KVMsgType::from_u32(msgtype).unwrap(), 
                 sendtime: Duration::new(secs, nanos), 
-                msg: msg,
+                data,
             })
             
         }
@@ -502,8 +462,10 @@ pub mod semaphores{
 pub mod syncdindex {
     use std::{collections::HashMap, path::Path};
     use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socket::sockopt::ReuseAddr, stat::Mode}};
-    use crate::{io::{KVKey, KVLogItem, KVValue}, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}};
+    use crate::{io::{KEY_SIZE, KVKey, KVLogItem, KVValue}, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}};
 
+    const LOGITEM_SIZE: usize = 28;
+    const ENTRY_SIZE: usize = KEY_SIZE + LOGITEM_SIZE;
 
     pub struct SyncdIndex {
         pub map: HashMap<KVKey, KVLogItem>,
@@ -518,6 +480,7 @@ pub mod syncdindex {
             }
         }
 
+        /* todo: init index from log file */
         pub fn from_file(path: &Path) -> Result<Self,Errno> {
             /* open persisted index file */
             let index_fd = match open(
@@ -544,15 +507,15 @@ pub mod syncdindex {
             }
 
             /* invalid byte size, should be factor of 512 */
-            if bytes_read % 512 != 0 { return Err(Errno::EINVAL); } 
+            if bytes_read % ENTRY_SIZE != 0 { return Err(Errno::EINVAL); } 
 
             /* read entries into new hashmap */
             let mut sindex = SyncdIndex::new();
-            let entries = bytes_read / 512;
+            let entries = bytes_read / ENTRY_SIZE;
             for i in 0..entries{
-                let offset = i * 512;
-                let key = KVKey::from_bytes(&buf[offset..offset+264]).unwrap();
-                let item = KVLogItem::from_bytes(&buf[offset+264..offset+264+28]).unwrap();
+                let offset = i * ENTRY_SIZE;
+                let key = KVKey::from_bytes(&buf[offset..offset+KEY_SIZE]).unwrap();
+                let item = KVLogItem::from_bytes(&buf[offset+KEY_SIZE..offset+KEY_SIZE+LOGITEM_SIZE]).unwrap();
                 match sindex.map.insert(key, item){
                     None => None,
                     Some(log_item) => {
@@ -568,6 +531,7 @@ pub mod syncdindex {
 
         }
 
+        /* todo: remove this */
         pub fn to_file(&self, path: &Path) -> Result<(), Errno>{
             /* open file for persist */
             let index_fd = open(
@@ -583,12 +547,10 @@ pub mod syncdindex {
 
             /* loop over map and append k:i to file */
             for (key, item) in self.map.iter(){
-                /* pad up to 512 bytes, why not */
                 let mut bytes: Vec<u8> = Vec::new();
-                bytes.extend(key.to_bytes());   // 256 + 8          = 264
+                bytes.extend(key.to_bytes());   // 256              = 256
                 bytes.extend(item.to_bytes());  // 8 + 8 + 8 + 4    = 28
-                bytes.extend([0u8;220]);        // 220              = 220
-
+                                                                    //    = 284
 
                 let mut bytes_written = 0;
                 while bytes_written < bytes.len(){

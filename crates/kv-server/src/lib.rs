@@ -1,4 +1,4 @@
-use std::{os::{fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}}, path::Path};
+use std::{os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}, path::Path, time::Duration};
 use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, stat::Mode}, unistd::{Whence, close, lseek, unlink}};
 use kv_shared::{io::{KVKey, KVStore, KVLogItem, KVValue}, ringbuffer::FdRingBuffer, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}, syncdindex::SyncdIndex};
 
@@ -163,7 +163,7 @@ pub fn kv_store_get(store: &mut KVStore, key: &KVKey) -> Result<Option<KVValue>,
 }
 
 /// Set key value pair in log
-pub fn kv_store_set(store: &mut KVStore, key: &KVKey, val: &KVValue) -> Result<(), Errno>{
+pub fn kv_store_set(store: &mut KVStore, key: &KVKey, val: &KVValue, set_time: Duration) -> Result<(), Errno>{
     let logitem = store.index.si_get(*key);
     if logitem.is_none(){
         /* add new KV pair */
@@ -185,14 +185,14 @@ pub fn kv_store_set(store: &mut KVStore, key: &KVKey, val: &KVValue) -> Result<(
         let new_logitem = KVLogItem{
             file_offset: new_offset as isize,
             data_size: data_size,
-            time_added: val.time_set.expect("val.timeset is none?"),
+            time_added: set_time,
         };
         store.index.si_insert(*key, new_logitem).unwrap();
         Ok(())
     } else {
         /* update KV pair */
         /* check that new value is fresh */
-        if logitem.unwrap().time_added > val.time_set.unwrap() {
+        if logitem.unwrap().time_added > set_time {
             return Err(Errno::ESTALE);
         }
 
@@ -216,7 +216,7 @@ pub fn kv_store_set(store: &mut KVStore, key: &KVKey, val: &KVValue) -> Result<(
         let new_logitem = KVLogItem{
             file_offset: new_offset as isize,
             data_size: data_size,
-            time_added: val.time_set.expect("val.timeset is none?"),
+            time_added: set_time,
         };
         store.index.si_insert(*key, new_logitem).unwrap();
 
@@ -325,7 +325,7 @@ pub mod threading {
 pub mod worker{
     use std::{ffi::c_void, os::fd::OwnedFd};
 
-    use kv_shared::{io::{KVConnection, KVKey, KVStore, KVMsg, KVMsgType, KVValue, KVValueType}, ringbuffer::FdRingBuffer};
+    use kv_shared::{io::{KEY_SIZE, KVConnection, KVKey, KVMsg, KVMsgType, KVStore, KVValue, VAL_SIZE}, ringbuffer::FdRingBuffer};
     use nix::errno::Errno;
     
     use crate::{kv_store_get, kv_store_set, threading::kv_pthread_detach};
@@ -380,41 +380,41 @@ pub mod worker{
         
             match msg.msgtype {
                 KVMsgType::Get => {
-                    println!("worker #{}: start GET", workerid);
-                    let key = KVKey::from_bytes(&msg.msg).unwrap();
-                    let val = match kv_store_get(log, &key){
-                        Ok(None) => Vec::new(),
-                        Ok(v) => v.unwrap().to_bytes(),
+                    println!("worker #{}: GET start", workerid);
+                    let key = KVKey::from_bytes(&msg.data[..KEY_SIZE]).unwrap();
+                    let return_val = match kv_store_get(log, &key){
+                        Ok(None) => KVValue::new("").unwrap(),
+                        Ok(v) => v.unwrap(),
                         Err(e) => {
                             eprint!("kv_log_get err: {}", e);
                             return Err(e);
                         }
                     };
-                    let msg = KVMsg::new(KVMsgType::GetReturn, val);
+                    let msg = KVMsg::new(KVMsgType::GetReturn, key, return_val);
                     connection.send_kvmsg(msg).unwrap();
-                    println!("worker #{}: handled GET", workerid);
+                    println!("worker #{}: GET end", workerid);
                 },
                 KVMsgType::Set => {                     
-                    println!("worker #{}: start SET", workerid);
-                    let key = KVKey::from_bytes(&msg.msg[..264]).unwrap();
-                    let mut val = KVValue::from_bytes(&msg.msg[264..]).unwrap();
-                    /* 
-                        todo: rework msg / value abstraction
-                        value time is initialized to None 
-                        time from msg needs to be passed over into value
-                    */
-                    val.time_set = Some(msg.sendtime); 
-                    let result = kv_store_set(log, &key, &val).unwrap();
+                    println!("worker #{}: SET start", workerid);
+                    let key = KVKey::from_bytes(&msg.data[..KEY_SIZE]).unwrap();
+                    let val = KVValue::from_bytes(&msg.data[KEY_SIZE..KEY_SIZE + VAL_SIZE]).unwrap(); 
+                    let result = match kv_store_set(log, &key, &val, msg.sendtime){
+                        Ok(_) => KVValue::new("ok").unwrap(),
+                        Err(_) => KVValue::new("set failed").unwrap(),
+                    };
 
-                    let body: Vec<u8> = String::from("good set!").into_bytes();
-                    let msg = KVMsg::new(KVMsgType::SetReturn, body);
+                    let msg = KVMsg::new(KVMsgType::SetReturn, key, result);
                     connection.send_kvmsg(msg).unwrap();
-                    println!("worker #{}: handled SET", workerid);
+                    println!("worker #{}: SET end", workerid);
                 },
                 KVMsgType::Delete => {
                     println!("worker #{}: start DEL", workerid);
-                    let body: Vec<u8> = String::from("good del!").into_bytes();
-                    let msg = KVMsg::new(KVMsgType::DeleteReturn, body);
+                    let key = KVKey::from_bytes(&msg.data[..KEY_SIZE]).unwrap();
+
+                    /* do delete */
+                    let return_val = KVValue::new("not implemented :(").unwrap();
+
+                    let msg = KVMsg::new(KVMsgType::DeleteReturn, key, return_val);
                     connection.send_kvmsg(msg).unwrap();
                     println!("worker #{}: handled DEL", workerid);
                 },

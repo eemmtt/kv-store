@@ -1,8 +1,8 @@
 //will contain implementations for CLI get, set, delete...
-use nix::sys::socket::{socket, connect, AddressFamily, SockFlag, SockType, UnixAddr};
+use nix::{libc::EINVAL, sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket}};
 use std::{os::fd::AsRawFd, time::Duration};
 use nix::{errno::Errno};
-use kv_shared::io::{KVConnection, KVKey, KVMsg, KVMsgType, KVValue};
+use kv_shared::io::{KEY_SIZE, KVConnection, KVKey, KVMsg, KVMsgType, KVValue, VAL_SIZE};
 
 
 pub fn new_client_kvconnection() -> Result<KVConnection, Errno>{
@@ -34,52 +34,65 @@ pub fn new_client_kvconnection() -> Result<KVConnection, Errno>{
     });
 }
 
-pub fn kvc_get(connection: &mut KVConnection, key: &KVKey) -> Result<KVValue, Errno> {
+pub fn kvc_get(connection: &mut KVConnection, key: KVKey) -> Result<KVValue, Errno> {
 
-    let msg = KVMsg::new(KVMsgType::Get, key.to_bytes());
+    let val = KVValue::new("").unwrap();
+    let msg = KVMsg::new(KVMsgType::Get, key, val);
 
     match connection.send_kvmsg(msg){
         Ok(y) => y,
         Err(e) => return Err(e),
     };
     let response = connection.recv_kvmsg().expect("recv_kvmsg fail");
-    if response.msg.len() > 0 {
-        let value = KVValue::from_bytes(&response.msg).expect("kvval from_bytes fail");
-        return Ok(value);
+
+    let _return_key = KVKey::from_bytes(&response.data[..KEY_SIZE]).unwrap();
+    let return_val = KVValue::from_bytes(&response.data[KEY_SIZE..KEY_SIZE + VAL_SIZE]).unwrap(); 
+
+    if response.msgtype as u32 == KVMsgType::GetReturn as u32{
+        Ok(return_val)
     } else {
-        return Ok(KVValue { 
-            value_type: kv_shared::io::KVValueType::String, 
-            time_set: None,
-            data: Vec::from("Couldn't get key") })
+        eprintln!("kvc_get: unhandled response msgtype {}", response.msgtype as u32);
+        Err(Errno::EINVAL)
     }
 }
 
-pub fn kvc_set(connection: &mut KVConnection, key: &KVKey, value: &KVValue) -> Result<Vec<u8>, Errno> {
+pub fn kvc_set(connection: &mut KVConnection, key: KVKey, value: KVValue) -> Result<KVValue, Errno> {
 
-    /*todo: define a KVPAIR struct for serialization / deserialization? */
-    let mut bytes: Vec<u8> = Vec::new();
-    bytes.extend(key.to_bytes());
-    bytes.extend(value.to_bytes());
-    let msg = KVMsg::new(KVMsgType::Set, bytes);
+    let msg = KVMsg::new(KVMsgType::Set, key, value);
 
     match connection.send_kvmsg(msg){
         Ok(y) => y,
         Err(e) => return Err(e),
     };
-    let response = connection.recv_kvmsg().unwrap();
+    let response = connection.recv_kvmsg().expect("recv_kvmsg fail");
+    let _return_key = KVKey::from_bytes(&response.data[..KEY_SIZE]).unwrap();
+    let return_val = KVValue::from_bytes(&response.data[KEY_SIZE..KEY_SIZE + VAL_SIZE]).unwrap(); 
 
-    /* todo: do something more specific here... */
-    Ok(response.msg)
+    if response.msgtype as u32 == KVMsgType::SetReturn as u32{
+        Ok(return_val)
+    } else {
+        eprintln!("kvc_set: unhandled response msgtype {}", response.msgtype as u32);
+        Err(Errno::EINVAL)
+    }
 }
 
-pub fn kvc_delete(connection: &mut KVConnection, key: &KVKey) -> Result<Vec<u8>, Errno>{
-    let msg = KVMsg::new(KVMsgType::Delete, key.to_bytes());
+pub fn kvc_delete(connection: &mut KVConnection, key: KVKey) -> Result<KVValue, Errno>{
+    
+    let val = KVValue::new("").unwrap();
+    let msg = KVMsg::new(KVMsgType::Delete, key, val);
 
     match connection.send_kvmsg(msg){
         Ok(y) => y,
         Err(e) => return Err(e),
     };
     let response = connection.recv_kvmsg().unwrap();
+    let _return_key = KVKey::from_bytes(&response.data[..KEY_SIZE]).unwrap();
+    let return_val = KVValue::from_bytes(&response.data[KEY_SIZE..KEY_SIZE + VAL_SIZE]).unwrap(); 
 
-    Ok(response.msg)
+    if response.msgtype as u32 == KVMsgType::DeleteReturn as u32{
+        Ok(return_val)
+    } else {
+        eprintln!("kvc_set: unhandled response msgtype {}", response.msgtype as u32);
+        Err(Errno::EINVAL)
+    }
 }

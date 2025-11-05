@@ -349,7 +349,7 @@ pub mod io {
         }
     }
 
-    pub struct KVLog{
+    pub struct KVStore{
         pub fd: OwnedFd,
         pub index: SyncdIndex,
         pub mtx: pthread_mutex_t,

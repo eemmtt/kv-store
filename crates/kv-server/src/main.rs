@@ -11,7 +11,7 @@ use std::os::fd::{ AsRawFd, OwnedFd, RawFd };
 use std::os::raw::c_void;
 use std::path::Path;
 
-use kv_server::{self, accept_connection, kv_log_load, kv_log_shutdown, open_socket};
+use kv_server::{self, accept_connection, kv_store_load, kv_store_shutdown, open_socket};
 use kv_server::threading::{kv_pthread_create};
 use kv_server::worker::{WorkerData, worker_thread};
 use kv_server::polling::{PollInterests, kv_epoll_add};
@@ -22,20 +22,20 @@ fn main() -> Result<(), Errno> {
     println!("server: start");
 
     /* load log and index */
-    let storage_path = Path::new("./storage");
-    let mut log = kv_log_load(storage_path).unwrap();
+    let store_path = Path::new("./storage");
+    let mut store = kv_store_load(store_path).unwrap();
 
     /* init work ring buffer */
     let mut rbuf = FdRingBuffer::init();
     
     /* init worker thread pool */
-    const THREAD_POOL_SIZE: usize = 5;
+    const THREAD_POOL_SIZE: usize = nix::unistd::sysc;
     for i in 0..THREAD_POOL_SIZE {
         let mut thread = 0 as pthread_t;
         let data = Box::new(WorkerData {
             id: i as u64,
             rbuf: &mut rbuf,
-            log: &mut log,
+            log: &mut store,
         });
         let arg = Box::into_raw(data) as *mut c_void;
         kv_pthread_create(&mut thread, worker_thread, arg).unwrap();
@@ -106,7 +106,7 @@ fn main() -> Result<(), Errno> {
     println!("server: cleaning up");
     close(socket_fd).expect("close socket_fd failed");
     unlink(socket_path).expect("unlink failed");
-    kv_log_shutdown(log, storage_path).expect("log_shutdown failed");
+    kv_store_shutdown(store, store_path).expect("log_shutdown failed");
     println!("server: stop");
     Ok(())
 }

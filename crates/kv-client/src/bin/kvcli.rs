@@ -52,6 +52,10 @@ fn main() {
                 let get_key = KVKey::new(key).unwrap();
                 let get_result = match kvc_get(&mut connection, get_key){
                     Ok(v) => v,
+                    Err(Errno::EPIPE) => {
+                        eprintln!("server disconnected");
+                        break;
+                    },
                     Err(e) => {
                         eprintln!("kvc_get failed: {}", e);
                         break;
@@ -71,7 +75,17 @@ fn main() {
                 let key = key.unwrap();
                 let set_key = KVKey::new(key).unwrap();
                 let set_val = KVValue::new(&value).unwrap();
-                let set_result = kvc_set(&mut connection, set_key, set_val).unwrap();
+                let set_result = match kvc_set(&mut connection, set_key, set_val){
+                    Ok(v) => v,
+                    Err(Errno::EPIPE) => {
+                        eprintln!("server disconnected");
+                        break;
+                    },
+                    Err(e) => {
+                        eprintln!("kvc_set failed: {}", e);
+                        break;
+                    }
+                };
                 println!("set: '{}'", set_result.as_str());
             },
             "delete" => {
@@ -81,7 +95,17 @@ fn main() {
                 }
                 let key = key.unwrap();
                 let del_key = KVKey::new(key).unwrap();
-                let del_result = kvc_delete(&mut connection, del_key).unwrap();
+                let del_result = match kvc_delete(&mut connection, del_key){
+                    Ok(v) => v,
+                    Err(Errno::EPIPE) => {
+                        eprintln!("server disconnected");
+                        break;
+                    },
+                    Err(e) => {
+                        eprintln!("kvc_delete failed: {}", e);
+                        break;
+                    }
+                };
                 println!("delete: '{}'", del_result.as_str());
             },
             "exit" => {

@@ -7,6 +7,9 @@ pub mod io {
     pub const USIZE_SIZE: usize = std::mem::size_of::<usize>();
     pub const KEY_SIZE: usize = 256;
     pub const VAL_SIZE: usize = 2048;
+    pub const SEC_SIZE: usize = size_of::<u64>();
+    pub const NANOS_SIZE: usize = size_of::<u32>();
+    pub const DUR_SIZE: usize = SEC_SIZE + NANOS_SIZE;
     pub const MSG_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u32>() + KEY_SIZE + VAL_SIZE;
 
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -591,6 +594,17 @@ pub mod syncdindex {
             let result = self.map.get(&key);
             kv_mutex_unlock(&mut self.mtx).unwrap();
             result
+        }
+
+        pub fn si_delete(&mut self, key: KVKey) -> Result<(), Errno>{
+            kv_mutex_lock(&mut self.mtx).unwrap();
+            let result = self.map.remove(&key);
+            kv_mutex_unlock(&mut self.mtx).unwrap();
+            if result.is_some() {
+                return Ok(());
+            } else {
+                return Err(Errno::ENOENT);
+            }
         }
 
     }

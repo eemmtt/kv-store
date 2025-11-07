@@ -1,6 +1,6 @@
 use std::{os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}, path::Path, time::Duration};
 use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, stat::Mode}, unistd::{Whence, close, lseek, unlink}};
-use kv_shared::{io::{KVKey, KVStore, KVLogItem, KVValue}, ringbuffer::FdRingBuffer, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}, syncdindex::SyncdIndex};
+use kv_shared::{io::{DUR_SIZE, KEY_SIZE, KVKey, KVLogItem, KVStore, KVValue, SEC_SIZE, VAL_SIZE}, ringbuffer::FdRingBuffer, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}, syncdindex::SyncdIndex};
 
 pub fn kv_load_log(store_path: &Path) -> Result<OwnedFd,()>{
     let log_path = store_path.join("kvlog");
@@ -139,10 +139,11 @@ pub fn kv_store_get(store: &mut KVStore, key: &KVKey) -> Result<Option<KVValue>,
     /* seek to data location and read data_size bytes */
     kv_mutex_lock(&mut store.mtx).unwrap();
     lseek(&store.fd, logitem.file_offset as i64, Whence::SeekSet).unwrap();
+    /* Entries are formatted: [key|set_time|deletion_time|value] */
+    let mut buf = [0u8; KEY_SIZE + DUR_SIZE + DUR_SIZE + VAL_SIZE]; 
     let mut bytes_read = 0;
-    let mut buf = vec![0u8; logitem.data_size]; /* todo: figure out real size... */
     while bytes_read < logitem.data_size {
-        match nix::unistd::read(&store.fd, &mut buf[bytes_read..logitem.data_size]) {
+        match nix::unistd::read(&store.fd, &mut buf[bytes_read..]) {
             Ok(0) => break,
             Ok(n) => bytes_read += n,
             Err(e) => {
@@ -152,7 +153,14 @@ pub fn kv_store_get(store: &mut KVStore, key: &KVKey) -> Result<Option<KVValue>,
     }
     kv_mutex_unlock(&mut store.mtx).unwrap();
 
-    let val = KVValue::from_bytes(&buf).unwrap();
+    /* check if entry was deleted */
+    let mut del_time = [0u8;DUR_SIZE];
+    del_time.copy_from_slice(&buf[KEY_SIZE + DUR_SIZE..KEY_SIZE + DUR_SIZE + DUR_SIZE]);
+    if del_time.iter().any(|&x| x != 0){
+        return Err(Errno::ENOENT);
+    }
+
+    let val = KVValue::from_bytes(&buf[KEY_SIZE + DUR_SIZE + DUR_SIZE..]).unwrap();
     Ok(Some(val))
 
 }
@@ -160,70 +168,99 @@ pub fn kv_store_get(store: &mut KVStore, key: &KVKey) -> Result<Option<KVValue>,
 /// Set key value pair in log
 pub fn kv_store_set(store: &mut KVStore, key: &KVKey, val: &KVValue, set_time: Duration) -> Result<(), Errno>{
     let logitem = store.index.si_get(*key);
-    if logitem.is_none(){
-        /* add new KV pair */
-        /* append to log */
-        kv_mutex_lock(&mut store.mtx).unwrap();
 
-        /* todo: update log entries to [key|set_time|del_time|value] or something... */
-        let val_as_bytes = val.to_bytes();
-        let data_size = val_as_bytes.len();
-        let new_offset = lseek(&store.fd, 0, Whence::SeekEnd).unwrap();
+    kv_mutex_lock(&mut store.mtx).unwrap();
+    if logitem.is_some(){
+        /* there is an existing value for this key. Check that the new value is fresh. If not, return early */
+        if logitem.unwrap().time_added > set_time {
+            kv_mutex_unlock(&mut store.mtx).unwrap();
+            return Err(Errno::ESTALE);
+        }
+
+        /* update previous log value with deletion time */
+        let deletion_time_offset = logitem.unwrap().file_offset as usize + KEY_SIZE + DUR_SIZE;
+        lseek(&store.fd, deletion_time_offset as i64, Whence::SeekSet).unwrap();
+        let mut del_time = [0u8;DUR_SIZE];
+        del_time[..SEC_SIZE].copy_from_slice(&set_time.as_secs().to_le_bytes());
+        del_time[SEC_SIZE..].copy_from_slice(&set_time.subsec_nanos().to_le_bytes());
         let mut bytes_written = 0;
-        while bytes_written < data_size {
-            match nix::unistd::write(&store.fd, &val_as_bytes[bytes_written..data_size]){
+        while bytes_written < del_time.len() {
+            match nix::unistd::write(&store.fd, &del_time[bytes_written..]){
                 Ok(n) => bytes_written += n,
                 Err(e) => return Err(e),
             }
         }
-        kv_mutex_unlock(&mut store.mtx).unwrap();
-    
-        /* add logitem to index */
-        let new_logitem = KVLogItem{
-            file_offset: new_offset as isize,
-            data_size: data_size,
-            time_added: set_time,
-        };
-        store.index.si_insert(*key, new_logitem).unwrap();
-        Ok(())
-    } else {
-        /* update KV pair */
-        /* check that new value is fresh */
-        if logitem.unwrap().time_added > set_time {
-            return Err(Errno::ESTALE);
-        }
 
-        /* append to log */
-        kv_mutex_lock(&mut store.mtx).unwrap();
-        let val_as_bytes = val.to_bytes();
-        let data_size = val_as_bytes.len();
-        let new_offset = lseek(&store.fd, 0, Whence::SeekEnd).unwrap();
-        let mut bytes_written = 0;
-        while bytes_written < data_size {
-            match nix::unistd::write(&store.fd, &val_as_bytes[bytes_written..data_size]){
-                Ok(n) => bytes_written += n,
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        };
-        kv_mutex_unlock(&mut store.mtx).unwrap();
-
-        /* update index */
-        let new_logitem = KVLogItem{
-            file_offset: new_offset as isize,
-            data_size: data_size,
-            time_added: set_time,
-        };
-        store.index.si_insert(*key, new_logitem).unwrap();
-
-        Ok(())
     }
+
+    /* write new entry to log. Entries are formatted: [key|set_time|deletion_time|value] */
+    let mut entry = [0u8;KEY_SIZE + DUR_SIZE + DUR_SIZE + VAL_SIZE];
+    entry[..KEY_SIZE].copy_from_slice(&key.to_bytes());
+    entry[KEY_SIZE..KEY_SIZE + SEC_SIZE].copy_from_slice(&set_time.as_secs().to_le_bytes());
+    entry[KEY_SIZE + SEC_SIZE..KEY_SIZE + DUR_SIZE].copy_from_slice(&set_time.subsec_nanos().to_le_bytes());
+    /* skip over a DUR_SIZE for deletion_time because array already initialized to 0's */
+    entry[KEY_SIZE + DUR_SIZE + DUR_SIZE..].copy_from_slice(&val.to_bytes());
+
+    let new_offset = lseek(&store.fd, 0, Whence::SeekEnd).unwrap();
+    let mut bytes_written = 0;
+    while bytes_written < entry.len() {
+        match nix::unistd::write(&store.fd, &entry[bytes_written..]){
+            Ok(n) => bytes_written += n,
+            Err(e) => return Err(e),
+        }
+    }
+    kv_mutex_unlock(&mut store.mtx).unwrap();
+
+    /* add logitem to index */
+    let new_logitem = KVLogItem{
+        file_offset: new_offset as isize,
+        data_size: entry.len(),
+        time_added: set_time,
+    };
+    store.index.si_insert(*key, new_logitem).unwrap();
+    Ok(())
 
 }
 
 /// Delete key value pair from log
-pub fn kv_store_delete(store: &mut KVStore, key: &KVKey) -> Result<(), Errno>{
+pub fn kv_store_delete(store: &mut KVStore, key: &KVKey, del_time: Duration) -> Result<(), Errno>{
+    let logitem = store.index.si_get(*key);
+    if logitem.is_none(){
+        /* nothing to delete! */
+        return Err(Errno::ENOENT);
+    }
+    if logitem.is_some(){
+        /* check that we're not deleting a key updated after the deletion was sent */
+        if logitem.unwrap().time_added > del_time {
+            return Err(Errno::ESTALE);
+        }
+
+        /* update log entry with deletion time */
+        /* entries are formatted: [key|set_time|deletion_time|value] */
+        kv_mutex_lock(&mut store.mtx).unwrap();
+        let deletion_time_offset = logitem.unwrap().file_offset as usize + KEY_SIZE + DUR_SIZE;
+        lseek(&store.fd, deletion_time_offset as i64, Whence::SeekSet).unwrap();
+
+        let mut del_time_bytes = [0u8;DUR_SIZE];
+        del_time_bytes[..SEC_SIZE].copy_from_slice(&del_time.as_secs().to_le_bytes());
+        del_time_bytes[SEC_SIZE..].copy_from_slice(&del_time.subsec_nanos().to_le_bytes());
+
+        let mut bytes_written = 0;
+        while bytes_written < del_time_bytes.len() {
+            match nix::unistd::write(&store.fd, &del_time_bytes[bytes_written..]){
+                Ok(n) => bytes_written += n,
+                Err(e) => {
+                    eprintln!("write failed: {}", e);
+                    return Err(e);
+                },
+            }
+        }
+        kv_mutex_unlock(&mut store.mtx).unwrap();
+
+        /* remove logitem from index */
+        store.index.si_delete(*key).expect("kv_store_delete wasn't able to remove the key from the index");
+    }
+    
     Ok(())
 }
 
@@ -325,7 +362,7 @@ pub mod worker{
     use kv_shared::{io::{KEY_SIZE, KVConnection, KVKey, KVMsg, KVMsgType, KVStore, KVValue, VAL_SIZE}, ringbuffer::FdRingBuffer};
     use nix::errno::Errno;
     
-    use crate::{kv_store_get, kv_store_set, threading::kv_pthread_detach};
+    use crate::{kv_store_delete, kv_store_get, kv_store_set, threading::kv_pthread_detach};
     
     /// Data passed as arg to worker_thread
     pub struct WorkerData<'a>{
@@ -382,6 +419,7 @@ pub mod worker{
                     let return_val = match kv_store_get(log, &key){
                         Ok(None) => KVValue::new("").unwrap(),
                         Ok(v) => v.unwrap(),
+                        Err(Errno::ENOENT) => KVValue::new("").unwrap(),
                         Err(e) => {
                             eprint!("kv_log_get err: {}", e);
                             return Err(e);
@@ -405,15 +443,21 @@ pub mod worker{
                     println!("worker #{}: SET end", workerid);
                 },
                 KVMsgType::Delete => {
-                    println!("worker #{}: start DEL", workerid);
+                    println!("worker #{}: DEL start", workerid);
                     let key = KVKey::from_bytes(&msg.data[..KEY_SIZE]).unwrap();
-
-                    /* do delete */
-                    let return_val = KVValue::new("not implemented :(").unwrap();
-
-                    let msg = KVMsg::new(KVMsgType::DeleteReturn, key, return_val);
+                    let result = match kv_store_delete(log, &key, msg.sendtime){
+                        Ok(_) => KVValue::new("ok").unwrap(),
+                        Err(Errno::ENONET) => KVValue::new("key not found").unwrap(),
+                        Err(Errno::ESTALE) => KVValue::new("delete failed. tried to delete old value").unwrap(),
+                        Err(e) => {
+                            eprintln!("worker #{}: DEL failed with {}", workerid, e);
+                            KVValue::new("delete failed").unwrap()
+                        },
+                    };
+                    
+                    let msg = KVMsg::new(KVMsgType::DeleteReturn, key, result);
                     connection.send_kvmsg(msg).unwrap();
-                    println!("worker #{}: handled DEL", workerid);
+                    println!("worker #{}: DEL end", workerid);
                 },
                 _ => {
                     println!("worker #{}: received unknown msg type", workerid);

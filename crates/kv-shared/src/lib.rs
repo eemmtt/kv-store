@@ -11,6 +11,7 @@ pub mod io {
     pub const NANOS_SIZE: usize = size_of::<u32>();
     pub const DUR_SIZE: usize = SEC_SIZE + NANOS_SIZE;
     pub const MSG_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u32>() + KEY_SIZE + VAL_SIZE;
+    pub const ENTRY_SIZE: usize = KEY_SIZE + DUR_SIZE + DUR_SIZE + VAL_SIZE;
 
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub struct KVKey {
@@ -463,12 +464,11 @@ pub mod semaphores{
 }
 
 pub mod syncdindex {
-    use std::{collections::HashMap, path::Path};
-    use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socket::sockopt::ReuseAddr, stat::Mode}};
-    use crate::{io::{KEY_SIZE, KVKey, KVLogItem, KVValue}, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}};
+    use std::{collections::HashMap, path::Path, time::Duration};
+    use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socket::sockopt::ReuseAddr, stat::{Mode, lstat}}, unistd::{Whence, lseek}};
+    use crate::{io::{ENTRY_SIZE, KEY_SIZE, KVKey, KVLogItem, KVValue, NANOS_SIZE, SEC_SIZE}, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}};
 
     const LOGITEM_SIZE: usize = 28;
-    const ENTRY_SIZE: usize = KEY_SIZE + LOGITEM_SIZE;
 
     pub struct SyncdIndex {
         pub map: HashMap<KVKey, KVLogItem>,
@@ -535,6 +535,57 @@ pub mod syncdindex {
             }
             Ok(sindex)
 
+        }
+
+        /// Create index directly from log file
+        pub fn from_log_file(path: &Path) -> Self{
+            /* open log file */
+            let log_fd = match open(path, OFlag::O_RDONLY, Mode::S_IRWXU){
+                Ok(fd) => fd,
+                Err(e) => {
+                    eprintln!("SyncdIndex::from_log_file open err {}", e);
+                    eprintln!("SyncdIndex::from_log_file returning empty index");
+                    return SyncdIndex::new();
+                }
+            };
+
+            let fstat = lstat(path).unwrap();
+            let fsize = fstat.st_size as usize;
+            if fsize % ENTRY_SIZE != 0 { eprintln!("from_log_file: warning, file size not divisible by entry size"); }
+            let nentries = fsize / ENTRY_SIZE;
+
+            /* read through file and add data from entries into index */
+            let mut index = SyncdIndex::new();
+            for i in 0..nentries{
+                let mut buf = [0u8;ENTRY_SIZE];
+                let mut nbytes = 0;
+                let file_offset = (i * ENTRY_SIZE) as i64;
+                lseek(&log_fd, file_offset, Whence::SeekSet).unwrap();
+                while nbytes < ENTRY_SIZE{
+                    match nix::unistd::read(&log_fd, &mut buf[nbytes..]){
+                        Ok(0) => break,
+                        Ok(n) => nbytes += n,
+                        Err(e) => {
+                            eprint!("from_log_file read err {}", e);
+                            eprintln!("SyncdIndex::from_log_file returning empty index");
+                            return SyncdIndex::new();
+                        }
+                    }
+                }
+
+                let key = KVKey::from_bytes(&buf[..KEY_SIZE]).unwrap();
+                let secs = u64::from_le_bytes(buf[KEY_SIZE..KEY_SIZE+SEC_SIZE].try_into().unwrap());
+                let nanos = u32::from_le_bytes(buf[KEY_SIZE+SEC_SIZE..KEY_SIZE+SEC_SIZE+NANOS_SIZE].try_into().unwrap());
+                let time_added = Duration::new(secs, nanos);
+                let logitem = KVLogItem{
+                    file_offset: file_offset as isize,
+                    data_size: ENTRY_SIZE,
+                    time_added,
+                };
+                index.map.insert(key, logitem);
+            }
+
+            index
         }
 
         /* todo: remove this */

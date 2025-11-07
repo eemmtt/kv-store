@@ -1,6 +1,6 @@
 use std::{os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}, path::Path, time::Duration};
-use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, stat::Mode}, unistd::{Whence, close, lseek, unlink}};
-use kv_shared::{io::{DUR_SIZE, KEY_SIZE, KVKey, KVLogItem, KVStore, KVValue, SEC_SIZE, VAL_SIZE}, ringbuffer::FdRingBuffer, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}, syncdindex::SyncdIndex};
+use nix::{errno::Errno, fcntl::{OFlag, open}, libc::{pthread_mutex_destroy, pthread_mutex_t}, sys::{socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, stat::{Mode, lstat}}, unistd::{Whence, close, lseek, unlink}};
+use kv_shared::{io::{DUR_SIZE, ENTRY_SIZE, KEY_SIZE, KVKey, KVLogItem, KVStore, KVValue, SEC_SIZE, VAL_SIZE}, ringbuffer::FdRingBuffer, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}, syncdindex::SyncdIndex};
 
 pub fn kv_load_log(store_path: &Path) -> Result<OwnedFd,()>{
     let log_path = store_path.join("kvlog");
@@ -20,6 +20,7 @@ pub fn kv_load_log(store_path: &Path) -> Result<OwnedFd,()>{
 }
 
 pub fn kv_load_index(store_path: &Path) -> Result<SyncdIndex, ()>{
+    /*
     let index_path = store_path.join("kvindex");
     let index = match SyncdIndex::from_file(&index_path){
         Ok(si) => si,
@@ -32,6 +33,10 @@ pub fn kv_load_index(store_path: &Path) -> Result<SyncdIndex, ()>{
             return Err(());
         }
     };
+    */
+
+    let log_path = store_path.join("kvlog");
+    let index = SyncdIndex::from_log_file(&log_path);
     Ok(index)
 }
 
@@ -39,11 +44,14 @@ pub fn kv_load_index(store_path: &Path) -> Result<SyncdIndex, ()>{
 pub fn kv_store_shutdown(store: KVStore, store_path: &Path) -> Result<(), Errno>{
     
     /* compact log */
-    let compacted_store = kv_store_compact(store, store_path).unwrap();
+    //let log_path = store_path.join("kvlog");
+    let compacted_store = kv_store_compact(store, &store_path).unwrap();
     
     /* persist index */
+    /*
     let index_path = store_path.join("kvindex");
     compacted_store.index.to_file(&index_path).unwrap();
+     */
 
     /* close log */
     let _ = close(compacted_store.fd).unwrap();
@@ -51,11 +59,10 @@ pub fn kv_store_shutdown(store: KVStore, store_path: &Path) -> Result<(), Errno>
     Ok(())
 }
 
-/// Compact log file to most recent undeleted data
-pub fn kv_store_compact(log: KVStore, store_path: &Path) -> Result<KVStore, Errno>{
+/// Compact log file of store to most recent undeleted data... maybe need a better name
+pub fn kv_store_compact(store: KVStore, base_path: &Path) -> Result<KVStore, Errno>{
     /* init new log and index */
-    let new_log_path = store_path.join("newlog");
-    let mut new_index = SyncdIndex::new();
+    let new_log_path = base_path.join("newlog");
     let new_log_fd = open(
         &new_log_path, 
         OFlag::O_RDWR
@@ -63,18 +70,28 @@ pub fn kv_store_compact(log: KVStore, store_path: &Path) -> Result<KVStore, Errn
         Mode::S_IRWXU
     ).expect("kv_store_compact open fail");
 
-    /* loop over old index, write all entries to new log and index */
-    for (key, item) in log.index.map.iter(){
+    /* get cur log size */
+    let cur_log_path = base_path.join("kvlog");
+    let file_stat = lstat(&cur_log_path).unwrap();
+    let cur_log_size = file_stat.st_size as usize;
+    let mut new_log_size:usize = 0;
+
+    for (i, (key, item)) in store.index.map.iter().enumerate(){
+        //println!("Entry {}: offset={}, size={}", i, item.file_offset, item.data_size);
         /* read old val into buf */
-        let _old_offset = nix::unistd::lseek(&log.fd, item.file_offset as i64, Whence::SeekSet).unwrap();
-        let mut buf = vec![0u8;item.data_size];
+        let _old_offset = nix::unistd::lseek(&store.fd, item.file_offset as i64, Whence::SeekSet).unwrap();
+        let mut buf = [0u8;ENTRY_SIZE];
         let mut nbytes_read = 0;
-        loop {
-            match nix::unistd::read(&log.fd, &mut buf[nbytes_read..]){
+        while nbytes_read < ENTRY_SIZE{
+            match nix::unistd::read(&store.fd, &mut buf[nbytes_read..]){
                 Ok(0) => break,
                 Ok(n) => nbytes_read += n,
                 Err(e) => return Err(e),
             }
+        }
+
+        if nbytes_read != ENTRY_SIZE {
+            eprintln!("kv_store_compact read {} bytes when it should have read {}", nbytes_read, ENTRY_SIZE);
         }
 
         /* write old val to end of new log */
@@ -86,43 +103,32 @@ pub fn kv_store_compact(log: KVStore, store_path: &Path) -> Result<KVStore, Errn
                 Err(e) => return Err(e),
             }
         }
-
-        /* insert new item to new index */
-        let new_item = KVLogItem {
-            file_offset: new_offset as isize,
-            data_size: nbytes_written,
-            time_added: item.time_added,
-        };
-        if new_index.map.insert(*key, new_item).is_some(){
-            eprintln!("something weird happened with new index");
-            return Err(Errno::EALREADY);
-        }
+        new_log_size += nbytes_written;
     }
 
     /* rename old and new logs */
-    let log_old_path_init = store_path.join("kvlog");
-    let log_old_path_fin = store_path.join("kvlog_old");
-    let log_new_path_init = store_path.join("newlog");
-    let log_new_path_fin = store_path.join("kvlog");
+    let old_log_path = base_path.join("kvlog_old");
     nix::fcntl::renameat(
         nix::fcntl::AT_FDCWD, 
-        &log_old_path_init, 
+        &cur_log_path, 
         nix::fcntl::AT_FDCWD, 
-        &log_old_path_fin
+        &old_log_path
     ).expect("failed rename old log");
     nix::fcntl::renameat(
         nix::fcntl::AT_FDCWD, 
-        &log_new_path_init, 
+        &new_log_path, 
         nix::fcntl::AT_FDCWD, 
-        &log_new_path_fin
+        &cur_log_path
     ).expect("failed rename new log");
 
     /* cleanup old log */
-    nix::unistd::close(log.fd).unwrap();
+    nix::unistd::close(store.fd).unwrap();
+    //unsafe {pthread_mutex_destroy( &mut store.mtx)};
 
+    println!("kv_store_compact: prev size was {}, compacted size is {}", cur_log_size, new_log_size);
     Ok(KVStore{
         fd: new_log_fd,
-        index: new_index,
+        index: store.index,
         mtx: kv_mutex_init().unwrap(),
     })
 }

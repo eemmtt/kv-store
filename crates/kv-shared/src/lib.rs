@@ -491,7 +491,7 @@ pub mod syncdindex {
                 Ok(fd) => fd,
                 Err(Errno::ENOENT) => return Err(Errno::ENOENT),
                 Err(e) => {
-                    eprintln!("open unhandled error: {}", e);
+                    eprintln!("from_file::open() err: {}", e);
                     return Err(e);
                 }
             };
@@ -502,12 +502,18 @@ pub mod syncdindex {
                 match nix::unistd::read(&index_fd, &mut buf){
                     Ok(0) => break,
                     Ok(n) => bytes_read += n,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        eprintln!("from_file::read() err: {}", e);
+                        return Err(e);
+                    },
                 }
             }
 
-            /* invalid byte size, should be factor of 512 */
-            if bytes_read % ENTRY_SIZE != 0 { return Err(Errno::EINVAL); } 
+            /* invalid byte size, should be factor of kv_shared::syncdindex::ENTRY_SIZE */
+            if bytes_read % ENTRY_SIZE != 0 { 
+                eprintln!("from_file: expected to read (n * ENTRY_SIZE) bytes but instead got {}", bytes_read);
+                return Err(Errno::EINVAL); 
+            } 
 
             /* read entries into new hashmap */
             let mut sindex = SyncdIndex::new();
@@ -519,14 +525,11 @@ pub mod syncdindex {
                 match sindex.map.insert(key, item){
                     None => None,
                     Some(log_item) => {
-                        eprintln!("syncdindex::from_file, key already existed in map");
+                        eprintln!("from_file: repeated key unexpectedly found while rebuilding map");
                         Some(log_item)
                     }
                 };
             }
-
-            //println!("loaded index has {} entries", sindex.map.len());
-
             Ok(sindex)
 
         }

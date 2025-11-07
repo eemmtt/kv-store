@@ -1,5 +1,6 @@
-use kv_shared::io::KVKey;
+use kv_shared::io::{KVKey, KVStore};
 use kv_shared::ringbuffer::FdRingBuffer;
+use kv_shared::semaphores::kv_mutex_init;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::libc::{pthread_t};
@@ -8,12 +9,11 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::unistd::{close, pipe2, unlink};
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::os::fd::{ AsRawFd, OwnedFd, RawFd };
+use std::os::fd::{ AsRawFd, OwnedFd };
 use std::os::raw::c_void;
 use std::path::Path;
 
-use kv_server::{self, accept_connection, kv_store_load, kv_store_shutdown, open_socket};
+use kv_server::{self, accept_connection, kv_load_index, kv_load_log, kv_store_shutdown, open_socket};
 use kv_server::threading::{kv_pthread_create};
 use kv_server::worker::{WorkerData, worker_thread};
 use kv_server::polling::{PollInterests, kv_epoll_add};
@@ -23,9 +23,16 @@ use kv_server::signaling::{PIPE_WRITE_FD, handle_signal};
 fn main() -> Result<(), Errno> {
     println!("server: start");
 
-    /* load log and index */
+    /* init store with log and index */
     let store_path = Path::new("./storage");
-    let mut store = kv_store_load(store_path).unwrap();
+    let log_fd = kv_load_log(store_path).unwrap();
+    let log_mtx = kv_mutex_init().unwrap();
+    let index = kv_load_index(store_path).unwrap();
+    let mut store = KVStore{
+        fd: log_fd,
+        index: index,
+        mtx: log_mtx,
+    };
 
     /* init work ring buffer */
     let mut rbuf = FdRingBuffer::init();
@@ -76,15 +83,14 @@ fn main() -> Result<(), Errno> {
 
     /* start polling */
     let mut events = [EpollEvent::empty()];
-    let mut poll_results_num: usize = 0;
                 
     'polling: loop {
         println!("server: polling");
-        poll_results_num = match epoll.wait(&mut events, PollTimeout::NONE){
-            Ok(size) => size,
+        match epoll.wait(&mut events, PollTimeout::NONE){
+            Ok(nevents) => nevents,
             Err(Errno::EINTR) => continue 'polling, /* todo: prevent polling msg from printing again? */
             Err(e) => {
-                eprintln!("server: epoll.wait() {}", e);
+                eprintln!("server: epoll.wait() err {}", e);
                 return Err(e);
             }
         };
@@ -106,9 +112,12 @@ fn main() -> Result<(), Errno> {
     }
 
     println!("server: cleaning up");
-    close(socket_fd).expect("close socket_fd failed");
-    unlink(socket_path).expect("unlink failed");
-    kv_store_shutdown(store, store_path).expect("log_shutdown failed");
+    close(socket_fd)
+        .expect("close socket_fd failed during cleanup");
+    unlink(socket_path)
+        .expect("socket_path unlink failed failed during cleanup");
+    kv_store_shutdown(store, store_path)
+        .expect("kv_store_shutdown failed during cleanup");
     println!("server: stop");
     Ok(())
 }

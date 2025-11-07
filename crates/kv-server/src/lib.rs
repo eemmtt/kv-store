@@ -2,8 +2,7 @@ use std::{os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd}, path::Path, time::Durati
 use nix::{errno::Errno, fcntl::{OFlag, open}, libc::pthread_mutex_t, sys::{socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr, accept, bind, listen, socket}, stat::Mode}, unistd::{Whence, close, lseek, unlink}};
 use kv_shared::{io::{KVKey, KVStore, KVLogItem, KVValue}, ringbuffer::FdRingBuffer, semaphores::{kv_mutex_init, kv_mutex_lock, kv_mutex_unlock}, syncdindex::SyncdIndex};
 
-/// Open log and load persisted index
-pub fn kv_store_load(store_path: &Path) -> Result<KVStore, Errno>{
+pub fn kv_load_log(store_path: &Path) -> Result<OwnedFd,()>{
     let log_path = store_path.join("kvlog");
     let fd = match open(
         &log_path, 
@@ -12,32 +11,28 @@ pub fn kv_store_load(store_path: &Path) -> Result<KVStore, Errno>{
     ){
         Ok(fd) => fd,
         Err(e) => {
-            return Err(e);
+            eprintln!("kv_load_log::open() failed with: {}", e);
+            return Err(());
         }
     };
 
-    /* try to load persisted index */
+    Ok(fd)
+}
+
+pub fn kv_load_index(store_path: &Path) -> Result<SyncdIndex, ()>{
     let index_path = store_path.join("kvindex");
     let index = match SyncdIndex::from_file(&index_path){
         Ok(si) => si,
-        Err(e) => {
-            eprintln!("failed to create syncdindex from file. Creating blank index instead");
+        Err(Errno::ENOENT) => {
+            eprintln!("kv_load_index couldn't find an index file so it created a blank index instead");
             SyncdIndex::new()
         }
+        Err(e) => {
+            eprintln!("SyncdIndex::from_file() failed with {}", e);
+            return Err(());
+        }
     };
-    /*
-    for (k,v) in index.map.iter(){
-        println!("{}:{}", k.as_str(), v);
-    }
-    */
-
-    let mtx = kv_mutex_init().unwrap();
-
-    Ok(KVStore{
-        fd,
-        index,
-        mtx,
-    })
+    Ok(index)
 }
 
 /// Close log and persist index to file
@@ -169,6 +164,8 @@ pub fn kv_store_set(store: &mut KVStore, key: &KVKey, val: &KVValue, set_time: D
         /* add new KV pair */
         /* append to log */
         kv_mutex_lock(&mut store.mtx).unwrap();
+
+        /* todo: update log entries to [key|set_time|del_time|value] or something... */
         let val_as_bytes = val.to_bytes();
         let data_size = val_as_bytes.len();
         let new_offset = lseek(&store.fd, 0, Whence::SeekEnd).unwrap();
